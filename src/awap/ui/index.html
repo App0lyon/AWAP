@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AWAP Editor</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="page-shell">
+      <div class="background-orb orb-one"></div>
+      <div class="background-orb orb-two"></div>
+      <header class="hero">
+        <div>
+          <p class="eyebrow">AI Workflow Automation Platform</p>
+          <h1>Workflow Editor</h1>
+          <p class="hero-copy">
+            Compose workflow graphs, version drafts, validate execution plans, and run jobs
+            against the Python API from one surface.
+          </p>
+        </div>
+        <div class="hero-actions">
+          <button id="new-workflow-button" class="button button-primary">New Workflow</button>
+          <button id="refresh-all-button" class="button button-secondary">Refresh Data</button>
+        </div>
+      </header>
+
+      <main class="workspace-grid">
+        <aside class="panel sidebar-panel">
+          <div class="panel-header">
+            <h2>Library</h2>
+            <span id="status-pill" class="status-pill">Booting</span>
+          </div>
+
+          <section class="stack-section">
+            <div class="section-title-row">
+              <h3>Workflows</h3>
+              <button id="refresh-workflows-button" class="button button-ghost">Refresh</button>
+            </div>
+            <div id="workflow-list" class="stack-list"></div>
+          </section>
+
+          <section class="stack-section">
+            <div class="section-title-row">
+              <h3>Versions</h3>
+              <span id="version-caption" class="muted-label">No workflow selected</span>
+            </div>
+            <div id="version-list" class="stack-list"></div>
+          </section>
+
+          <section class="stack-section">
+            <div class="section-title-row">
+              <h3>Palette</h3>
+              <span class="muted-label">Node Types</span>
+            </div>
+            <div id="node-type-list" class="badge-grid"></div>
+          </section>
+
+          <section class="stack-section">
+            <div class="section-title-row">
+              <h3>Providers</h3>
+              <span class="muted-label">Registry</span>
+            </div>
+            <div id="provider-list" class="stack-list compact-list"></div>
+          </section>
+
+          <section class="stack-section">
+            <div class="section-title-row">
+              <h3>Credentials</h3>
+              <button id="add-credential-button" class="button button-ghost">Add</button>
+            </div>
+            <div id="credential-list" class="stack-list compact-list"></div>
+          </section>
+        </aside>
+
+        <section class="panel editor-panel">
+          <div class="panel-header">
+            <div>
+              <h2>Editor</h2>
+              <p id="editor-caption" class="muted-label">Draft a new workflow</p>
+            </div>
+            <div class="toolbar">
+              <button id="save-workflow-button" class="button button-primary">
+                Save New Workflow
+              </button>
+              <button id="save-version-button" class="button button-secondary">
+                Save New Version
+              </button>
+              <button id="publish-version-button" class="button button-secondary">
+                Publish Selected
+              </button>
+            </div>
+          </div>
+
+          <section class="meta-grid">
+            <label class="field">
+              <span>Name</span>
+              <input id="workflow-name" type="text" placeholder="Customer support triage" />
+            </label>
+            <label class="field field-wide">
+              <span>Description</span>
+              <textarea
+                id="workflow-description"
+                rows="3"
+                placeholder="Describe the workflow intent, audience, and operational goal."
+              ></textarea>
+            </label>
+          </section>
+
+          <section class="editor-columns">
+            <div class="subpanel">
+              <div class="section-title-row">
+                <h3>Nodes</h3>
+                <button id="add-node-button" class="button button-primary">Add Node</button>
+              </div>
+              <div id="node-editor-list" class="node-editor-list"></div>
+            </div>
+
+            <div class="subpanel">
+              <div class="section-title-row">
+                <h3>Edges</h3>
+                <button id="add-edge-button" class="button button-primary">Add Edge</button>
+              </div>
+              <div id="edge-editor-list" class="edge-editor-list"></div>
+            </div>
+          </section>
+
+          <section class="subpanel canvas-panel">
+            <div class="section-title-row">
+              <h3>Flow Preview</h3>
+              <span class="muted-label">Topology snapshot from the current editor state</span>
+            </div>
+            <div id="canvas-preview" class="canvas-preview"></div>
+          </section>
+        </section>
+
+        <aside class="panel inspector-panel">
+          <div class="panel-header">
+            <div>
+              <h2>Inspector</h2>
+              <p class="muted-label">Validate, plan, execute, and inspect runs</p>
+            </div>
+            <div class="toolbar">
+              <button id="validate-button" class="button button-secondary">Validate</button>
+              <button id="plan-button" class="button button-secondary">Plan</button>
+              <button id="run-button" class="button button-primary">Run Selected</button>
+            </div>
+          </div>
+
+          <section class="stack-section">
+            <div class="section-title-row">
+              <h3>Validation</h3>
+              <span id="validation-status" class="muted-label">Not run</span>
+            </div>
+            <pre id="validation-output" class="output-box">No validation result yet.</pre>
+          </section>
+
+          <section class="stack-section">
+            <div class="section-title-row">
+              <h3>Execution Plan</h3>
+              <span id="plan-caption" class="muted-label">No plan loaded</span>
+            </div>
+            <div id="plan-output" class="stack-list compact-list"></div>
+          </section>
+
+          <section class="stack-section">
+            <div class="section-title-row">
+              <h3>Run Input</h3>
+              <span class="muted-label">JSON payload for the selected version</span>
+            </div>
+            <textarea id="run-input" class="output-box" spellcheck="false">{}</textarea>
+          </section>
+
+          <section class="stack-section">
+            <div class="section-title-row">
+              <h3>Runs</h3>
+              <button id="refresh-runs-button" class="button button-ghost">Refresh</button>
+            </div>
+            <div id="run-list" class="stack-list"></div>
+          </section>
+
+          <section class="stack-section">
+            <div class="section-title-row">
+              <h3>Run Events</h3>
+              <span id="run-event-caption" class="muted-label">No run selected</span>
+            </div>
+            <div id="run-event-list" class="event-list"></div>
+          </section>
+        </aside>
+      </main>
+    </div>
+
+    <dialog id="credential-dialog" class="credential-dialog">
+      <form method="dialog" id="credential-form" class="credential-form">
+        <div class="dialog-header">
+          <h3>Add Credential</h3>
+          <button value="cancel" class="button button-ghost">Close</button>
+        </div>
+        <label class="field">
+          <span>Name</span>
+          <input id="credential-name" type="text" required />
+        </label>
+        <label class="field">
+          <span>Kind</span>
+          <select id="credential-kind">
+            <option value="generic">generic</option>
+            <option value="api_key">api_key</option>
+            <option value="bearer_token">bearer_token</option>
+            <option value="header_map">header_map</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>Provider</span>
+          <select id="credential-provider"></select>
+        </label>
+        <label class="field">
+          <span>Description</span>
+          <input id="credential-description" type="text" />
+        </label>
+        <label class="field field-wide">
+          <span>Secret Payload JSON</span>
+          <textarea id="credential-secret" rows="6">{}</textarea>
+        </label>
+        <div class="dialog-actions">
+          <button id="save-credential-button" value="default" class="button button-primary">
+            Save Credential
+          </button>
+        </div>
+      </form>
+    </dialog>
+
+    <script type="module" src="/static/app.js"></script>
+  </body>
+</html>
