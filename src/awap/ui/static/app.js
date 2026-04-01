@@ -3,6 +3,7 @@ const state = {
   nodeTypes: [],
   providers: [],
   credentials: [],
+  templates: [],
   workflows: [],
   versions: [],
   selectedWorkflowId: null,
@@ -10,15 +11,21 @@ const state = {
   draft: createBlankWorkflow(),
   validation: null,
   plan: null,
+  versionDiff: null,
   runs: [],
   selectedRunId: null,
   runEvents: [],
+  comments: [],
+  auditLogs: [],
+  operationsSummary: null,
+  sourceControl: null,
   runPollTimer: null,
 }
 
 const els = {
   statusPill: document.querySelector("#status-pill"),
   workflowList: document.querySelector("#workflow-list"),
+  workflowTemplateList: document.querySelector("#workflow-template-list"),
   versionList: document.querySelector("#version-list"),
   versionCaption: document.querySelector("#version-caption"),
   nodeTypeList: document.querySelector("#node-type-list"),
@@ -27,6 +34,7 @@ const els = {
   editorCaption: document.querySelector("#editor-caption"),
   workflowName: document.querySelector("#workflow-name"),
   workflowDescription: document.querySelector("#workflow-description"),
+  workflowReleaseNotes: document.querySelector("#workflow-release-notes"),
   nodeEditorList: document.querySelector("#node-editor-list"),
   edgeEditorList: document.querySelector("#edge-editor-list"),
   canvasPreview: document.querySelector("#canvas-preview"),
@@ -34,10 +42,16 @@ const els = {
   validationOutput: document.querySelector("#validation-output"),
   planCaption: document.querySelector("#plan-caption"),
   planOutput: document.querySelector("#plan-output"),
+  versionDiffOutput: document.querySelector("#version-diff-output"),
   runInput: document.querySelector("#run-input"),
   runList: document.querySelector("#run-list"),
   runEventCaption: document.querySelector("#run-event-caption"),
   runEventList: document.querySelector("#run-event-list"),
+  commentInput: document.querySelector("#comment-input"),
+  commentList: document.querySelector("#comment-list"),
+  operationsSummaryOutput: document.querySelector("#operations-summary-output"),
+  sourceControlOutput: document.querySelector("#source-control-output"),
+  auditLogList: document.querySelector("#audit-log-list"),
   credentialDialog: document.querySelector("#credential-dialog"),
   credentialForm: document.querySelector("#credential-form"),
   credentialProvider: document.querySelector("#credential-provider"),
@@ -46,6 +60,7 @@ const els = {
 
 const defaultConfigByType = {
   manual_trigger: {},
+  webhook_trigger: {},
   schedule_trigger: { cron: "0 * * * *" },
   llm_prompt: {
     provider: "nvidia_build_free_chat",
@@ -117,6 +132,7 @@ async function boot() {
   els.authToken.value = state.authToken
   bindEvents()
   await refreshLibrary()
+  await refreshOperations()
   renderAll()
 
   if (state.workflows.length > 0) {
@@ -147,8 +163,11 @@ function bindEvents() {
   document.querySelector("#resume-run-button").addEventListener("click", resumeSelectedRun)
   document.querySelector("#cancel-run-button").addEventListener("click", cancelSelectedRun)
   document.querySelector("#retry-run-button").addEventListener("click", retrySelectedRun)
+  document.querySelector("#compare-version-button").addEventListener("click", compareSelectedVersion)
+  document.querySelector("#save-comment-button").addEventListener("click", saveComment)
 
   els.workflowList.addEventListener("click", onWorkflowListClick)
+  els.workflowTemplateList.addEventListener("click", onTemplateListClick)
   els.versionList.addEventListener("click", onVersionListClick)
   els.nodeTypeList.addEventListener("click", onNodePaletteClick)
   els.nodeEditorList.addEventListener("click", onNodeEditorClick)
@@ -159,11 +178,13 @@ function bindEvents() {
 
   els.workflowName.addEventListener("change", syncDraftSafely)
   els.workflowDescription.addEventListener("change", syncDraftSafely)
+  els.workflowReleaseNotes.addEventListener("change", syncDraftSafely)
   els.credentialForm.addEventListener("submit", saveCredential)
 }
 
 async function refreshEverything() {
   await refreshLibrary()
+  await refreshOperations()
   if (state.selectedWorkflowId) {
     await loadWorkflow(state.selectedWorkflowId, state.selectedVersion)
   } else {
@@ -173,19 +194,32 @@ async function refreshEverything() {
 
 async function refreshLibrary() {
   setStatus("Loading")
-  const [nodeTypes, providers, credentials, workflows] = await Promise.all([
+  const [nodeTypes, providers, credentials, workflows, templates] = await Promise.all([
     api("/node-types"),
     api("/providers"),
     api("/credentials"),
     api("/workflows"),
+    api("/workflow-templates"),
   ])
   state.nodeTypes = nodeTypes
   state.providers = providers
   state.credentials = credentials
   state.workflows = workflows
+  state.templates = templates
   populateCredentialProviderOptions()
   renderLibrary()
   setStatus("Ready")
+}
+
+async function refreshOperations() {
+  const [summary, sourceControl, auditLogs] = await Promise.allSettled([
+    api("/observability/summary"),
+    api("/source-control/status"),
+    api("/audit-logs?limit=25"),
+  ])
+  state.operationsSummary = summary.status === "fulfilled" ? summary.value : null
+  state.sourceControl = sourceControl.status === "fulfilled" ? sourceControl.value : null
+  state.auditLogs = auditLogs.status === "fulfilled" ? auditLogs.value : []
 }
 
 async function refreshWorkflows() {
@@ -201,6 +235,11 @@ async function loadWorkflow(workflowId, version = null) {
   state.selectedVersion = workflow.version
   state.draft = workflowToDraft(workflow)
   state.versions = await api(`/workflows/${workflowId}/versions`)
+  state.comments = await api(`/workflows/${workflowId}/comments?workflow_version=${workflow.version}`)
+  state.versionDiff =
+    workflow.version > 1
+      ? await api(`/workflows/${workflowId}/versions/compare?from_version=${workflow.version - 1}&to_version=${workflow.version}`)
+      : null
   state.validation = null
   state.plan = null
   state.selectedRunId = null
@@ -382,6 +421,19 @@ async function retrySelectedRun() {
   startRunPolling(run.id)
 }
 
+async function compareSelectedVersion() {
+  requireSelection()
+  if (!state.selectedVersion || state.selectedVersion <= 1) {
+    state.versionDiff = null
+    renderVersionDiff()
+    return
+  }
+  state.versionDiff = await api(
+    `/workflows/${state.selectedWorkflowId}/versions/compare?from_version=${state.selectedVersion - 1}&to_version=${state.selectedVersion}`
+  )
+  renderVersionDiff()
+}
+
 async function saveCredential(event) {
   event.preventDefault()
   const secretPayload = parseJson(
@@ -408,6 +460,31 @@ function openCredentialDialog() {
   els.credentialDialog.showModal()
 }
 
+async function saveComment() {
+  if (!state.selectedWorkflowId || !state.selectedVersion) {
+    throw new Error("Select a workflow version first.")
+  }
+  const body = els.commentInput.value.trim()
+  if (!body) {
+    throw new Error("Write a comment before posting.")
+  }
+  await api(`/workflows/${state.selectedWorkflowId}/comments`, {
+    method: "POST",
+    body: JSON.stringify({
+      workflow_id: state.selectedWorkflowId,
+      workflow_version: state.selectedVersion,
+      body,
+    }),
+  })
+  els.commentInput.value = ""
+  state.comments = await api(
+    `/workflows/${state.selectedWorkflowId}/comments?workflow_version=${state.selectedVersion}`
+  )
+  state.auditLogs = await api("/audit-logs?limit=25")
+  renderComments()
+  renderAdminView()
+}
+
 function onWorkflowListClick(event) {
   const button = event.target.closest("[data-workflow-id]")
   if (!button) {
@@ -424,6 +501,19 @@ function onVersionListClick(event) {
     return
   }
   loadWorkflow(state.selectedWorkflowId, Number(button.dataset.version)).catch(handleError)
+}
+
+function onTemplateListClick(event) {
+  const button = event.target.closest("[data-template-key]")
+  if (!button) {
+    return
+  }
+  const template = state.templates.find((item) => item.key === button.dataset.templateKey)
+  if (!template) {
+    return
+  }
+  resetEditor(structuredClone(template.workflow))
+  setStatus(`Loaded ${template.display_name}`)
 }
 
 function onNodePaletteClick(event) {
@@ -583,6 +673,7 @@ function collectEditorPayload() {
   return {
     name: els.workflowName.value.trim(),
     description: els.workflowDescription.value.trim(),
+    release_notes: els.workflowReleaseNotes.value.trim(),
     nodes,
     edges,
     settings: state.draft.settings || { max_concurrent_runs: 3 },
@@ -594,12 +685,16 @@ function renderAll() {
   renderEditor()
   renderValidation()
   renderPlan()
+  renderVersionDiff()
   renderRuns()
   renderRunEvents()
+  renderComments()
+  renderAdminView()
 }
 
 function renderLibrary() {
   renderWorkflowList()
+  renderTemplates()
   renderVersionList()
   renderNodeTypes()
   renderProviders()
@@ -641,6 +736,22 @@ function renderVersionList() {
             <span class="pill">${escapeHtml(version.state)}</span>
           </div>
           <div class="item-meta">${escapeHtml(version.name)}</div>
+        </button>
+      `
+    )
+    .join("")
+}
+
+function renderTemplates() {
+  els.workflowTemplateList.innerHTML = state.templates
+    .map(
+      (template) => `
+        <button class="workflow-item" data-template-key="${escapeHtml(template.key)}">
+          <div class="item-headline">
+            <strong class="item-title">${escapeHtml(template.display_name)}</strong>
+            <span class="pill">${escapeHtml(template.category)}</span>
+          </div>
+          <div class="item-meta">${escapeHtml(template.description)}</div>
         </button>
       `
     )
@@ -696,6 +807,7 @@ function renderCredentials() {
 function renderEditor() {
   els.workflowName.value = state.draft.name || ""
   els.workflowDescription.value = state.draft.description || ""
+  els.workflowReleaseNotes.value = state.draft.release_notes || ""
   renderCaption()
 
   els.nodeEditorList.innerHTML = state.draft.nodes
@@ -840,25 +952,112 @@ function renderEdgeCard(edge, index) {
 }
 
 function renderCanvasPreview() {
+  if (state.draft.nodes.length === 0) {
+    els.canvasPreview.innerHTML = ""
+    return
+  }
+
+  const nodeMap = Object.fromEntries(state.draft.nodes.map((node) => [node.id, node]))
+  const incomingCounts = Object.fromEntries(state.draft.nodes.map((node) => [node.id, 0]))
   const outgoingMap = state.draft.edges.reduce((map, edge) => {
-    map[edge.source] = [...(map[edge.source] || []), edge.target]
+    map[edge.source] = [...(map[edge.source] || []), edge]
+    incomingCounts[edge.target] = (incomingCounts[edge.target] || 0) + 1
     return map
   }, {})
-  els.canvasPreview.innerHTML = state.draft.nodes
-    .map((node) => {
-      const targets = (outgoingMap[node.id] || []).map((item) => escapeHtml(item)).join(", ")
+
+  const roots = state.draft.nodes
+    .filter((node) => (incomingCounts[node.id] || 0) === 0)
+    .map((node) => node.id)
+  const depthById = Object.fromEntries(state.draft.nodes.map((node) => [node.id, 0]))
+  const queue = [...roots]
+  while (queue.length > 0) {
+    const currentId = queue.shift()
+    for (const edge of outgoingMap[currentId] || []) {
+      const nextDepth = depthById[currentId] + 1
+      if (nextDepth > (depthById[edge.target] || 0)) {
+        depthById[edge.target] = nextDepth
+      }
+      queue.push(edge.target)
+    }
+  }
+
+  const laneMap = {}
+  for (const node of state.draft.nodes) {
+    const lane = depthById[node.id] || 0
+    laneMap[lane] = [...(laneMap[lane] || []), node]
+  }
+  const laneKeys = Object.keys(laneMap)
+    .map(Number)
+    .sort((left, right) => left - right)
+  const cardWidth = 180
+  const cardHeight = 110
+  const laneGap = 220
+  const rowGap = 150
+  const positions = {}
+  laneKeys.forEach((lane, laneIndex) => {
+    laneMap[lane].forEach((node, rowIndex) => {
+      positions[node.id] = {
+        x: 24 + laneIndex * laneGap,
+        y: 32 + rowIndex * rowGap,
+      }
+    })
+  })
+  const stageWidth = Math.max(520, laneKeys.length * laneGap + 120)
+  const stageHeight =
+    Math.max(
+      240,
+      ...state.draft.nodes.map((node) => (positions[node.id]?.y || 0) + cardHeight + 36)
+    ) || 240
+
+  const edgeMarkup = state.draft.edges
+    .map((edge) => {
+      const source = positions[edge.source]
+      const target = positions[edge.target]
+      if (!source || !target) {
+        return ""
+      }
+      const startX = source.x + cardWidth
+      const startY = source.y + cardHeight / 2
+      const endX = target.x
+      const endY = target.y + cardHeight / 2
+      const midX = (startX + endX) / 2
+      const label = edge.label || edge.condition_value || (edge.is_default ? "default" : "")
       return `
-        <article class="canvas-card">
+        <path class="canvas-edge" d="M ${startX} ${startY} C ${midX} ${startY}, ${midX} ${endY}, ${endX} ${endY}" />
+        ${
+          label
+            ? `<text class="canvas-edge-label" x="${midX}" y="${(startY + endY) / 2 - 6}">${escapeHtml(String(label))}</text>`
+            : ""
+        }
+      `
+    })
+    .join("")
+
+  const nodeMarkup = state.draft.nodes
+    .map((node) => {
+      const position = positions[node.id]
+      const outgoingTargets = (outgoingMap[node.id] || []).map((edge) => edge.target).join(", ")
+      return `
+        <article class="canvas-card graph-card" style="left:${position.x}px; top:${position.y}px; width:${cardWidth}px; height:${cardHeight}px;">
           <div class="item-headline">
             <strong class="item-title">${escapeHtml(node.label)}</strong>
             <span class="pill">${escapeHtml(node.type)}</span>
           </div>
           <div class="item-meta">${escapeHtml(node.id)}</div>
-          <div class="item-meta">Flows to: ${targets || "No outgoing edges"}</div>
+          <div class="item-meta">To: ${escapeHtml(outgoingTargets || "none")}</div>
         </article>
       `
     })
-    .join(`<div class="canvas-arrow">→</div>`)
+    .join("")
+
+  els.canvasPreview.innerHTML = `
+    <div class="canvas-stage" style="width:${stageWidth}px; height:${stageHeight}px;">
+      <svg class="canvas-svg" viewBox="0 0 ${stageWidth} ${stageHeight}" preserveAspectRatio="none">
+        ${edgeMarkup}
+      </svg>
+      ${nodeMarkup}
+    </div>
+  `
 }
 
 function renderValidation() {
@@ -893,6 +1092,17 @@ function renderPlan() {
     .join("")
 }
 
+function renderVersionDiff() {
+  if (!state.versionDiff) {
+    els.versionDiffOutput.textContent =
+      state.selectedVersion && state.selectedVersion > 1
+        ? "Compare to the previous version to inspect release changes."
+        : "No version diff loaded."
+    return
+  }
+  els.versionDiffOutput.textContent = jsonPretty(state.versionDiff)
+}
+
 function renderRuns() {
   els.runList.innerHTML = state.runs
     .map(
@@ -925,6 +1135,46 @@ function renderRunEvents() {
             ${escapeHtml(event.timestamp)}${event.provider_key ? ` · ${escapeHtml(event.provider_key)}` : ""}
           </div>
           <pre class="output-box">${escapeHtml(jsonPretty(event.payload || {}))}</pre>
+        </div>
+      `
+    )
+    .join("")
+}
+
+function renderComments() {
+  els.commentList.innerHTML = state.comments
+    .map(
+      (comment) => `
+        <div class="event-item">
+          <div class="item-headline">
+            <strong class="item-title">Version ${comment.workflow_version}</strong>
+            <span class="pill">${escapeHtml(comment.author_id.slice(0, 8))}</span>
+          </div>
+          <div class="item-meta">${escapeHtml(comment.created_at)}</div>
+          <div>${escapeHtml(comment.body)}</div>
+        </div>
+      `
+    )
+    .join("")
+}
+
+function renderAdminView() {
+  els.operationsSummaryOutput.textContent = state.operationsSummary
+    ? jsonPretty(state.operationsSummary)
+    : "No operational summary loaded."
+  els.sourceControlOutput.textContent = state.sourceControl
+    ? jsonPretty(state.sourceControl)
+    : "No source-control data loaded."
+  els.auditLogList.innerHTML = state.auditLogs
+    .map(
+      (entry) => `
+        <div class="event-item">
+          <div class="item-headline">
+            <strong class="item-title">${escapeHtml(entry.action)}</strong>
+            <span class="pill">${escapeHtml(entry.actor_id || "system")}</span>
+          </div>
+          <div class="item-meta">${escapeHtml(entry.created_at)}</div>
+          <pre class="output-box">${escapeHtml(jsonPretty(entry.payload || {}))}</pre>
         </div>
       `
     )
@@ -990,6 +1240,7 @@ function createBlankWorkflow() {
   return {
     name: "",
     description: "",
+    release_notes: "",
     settings: { max_concurrent_runs: 3 },
     nodes: [
       {
@@ -1007,6 +1258,7 @@ function workflowToDraft(workflow) {
   return {
     name: workflow.name,
     description: workflow.description,
+    release_notes: workflow.release_notes || "",
     nodes: workflow.nodes,
     edges: workflow.edges,
     settings: workflow.settings || { max_concurrent_runs: 3 },
@@ -1019,9 +1271,11 @@ function resetEditor(draft) {
   state.versions = []
   state.validation = null
   state.plan = null
+  state.versionDiff = null
   state.runs = []
   state.selectedRunId = null
   state.runEvents = []
+  state.comments = []
   stopRunPolling()
   state.draft = draft
   renderAll()

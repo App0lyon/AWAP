@@ -35,10 +35,12 @@ from awap.domain import (
     ApprovalDecision,
     ApprovalDecisionRequest,
     ApprovalTaskDefinition,
+    AuditLogEntry,
     CredentialCreateRequest,
     CredentialDefinition,
     CredentialKind,
     CredentialSecret,
+    DeadLetterDefinition,
     EvaluationCaseResult,
     EvaluationRunDefinition,
     EvaluationStatus,
@@ -48,16 +50,25 @@ from awap.domain import (
     KnowledgeChunk,
     KnowledgeDocumentCreateRequest,
     KnowledgeDocumentDefinition,
+    ObservabilitySummary,
     PromptTemplateCreateRequest,
     PromptTemplateDefinition,
     RunEventLevel,
+    WorkflowEnvironmentCreateRequest,
+    WorkflowEnvironmentDefinition,
+    WorkflowEnvironmentReleaseDefinition,
     UserCreateRequest,
     UserDefinition,
     UserRole,
     UserWithToken,
     WorkflowDefinition,
+    WorkflowCommentCreateRequest,
+    WorkflowCommentDefinition,
+    WorkflowExportBundle,
     WorkflowEdge,
+    WorkflowImportRequest,
     WorkflowNode,
+    WorkflowPromotionRequest,
     WorkflowRun,
     WorkflowRunEvent,
     WorkflowRunStatus,
@@ -65,6 +76,8 @@ from awap.domain import (
     WorkflowRunStepStatus,
     WorkflowSettings,
     WorkflowState,
+    WorkflowVersionDiff,
+    WorkflowTriggerStateDefinition,
 )
 from awap.knowledge import citation_for_chunk, chunk_text, embed_text, rerank_chunks
 from awap.security import decrypt_secret_payload, encrypt_secret_payload, generate_bearer_token, hash_token
@@ -77,6 +90,10 @@ class WorkflowRepository(Protocol):
     def list_versions(self, workflow_id: str) -> list[WorkflowDefinition]: ...
     def get_next_version(self, workflow_id: str) -> int: ...
     def publish(self, workflow_id: str, version: int) -> WorkflowDefinition | None: ...
+    def create_comment(self, request: WorkflowCommentCreateRequest, *, author_id: str) -> WorkflowCommentDefinition: ...
+    def list_comments(self, workflow_id: str, workflow_version: int | None = None) -> list[WorkflowCommentDefinition]: ...
+    def append_audit_log(self, entry: AuditLogEntry) -> AuditLogEntry: ...
+    def list_audit_logs(self, workflow_id: str | None = None, run_id: str | None = None, limit: int = 100) -> list[AuditLogEntry]: ...
 
     def create_run(
         self,
@@ -84,6 +101,8 @@ class WorkflowRepository(Protocol):
         plan: ExecutionPlan,
         input_payload: dict,
         *,
+        environment: str | None = None,
+        trigger_node_ids: list[str] | None = None,
         idempotency_key: str | None = None,
         timeout_seconds: int | None = None,
         retry_of_run_id: str | None = None,
@@ -139,6 +158,23 @@ class WorkflowRepository(Protocol):
 
     def append_run_event(self, *, run_id: str, workflow_id: str, workflow_version: int, event_type: str, message: str, level: RunEventLevel = RunEventLevel.info, provider_key: str | None = None, step_index: int | None = None, payload: dict | None = None) -> WorkflowRunEvent: ...
     def list_run_events(self, run_id: str) -> list[WorkflowRunEvent]: ...
+    def search_runs(self, *, workflow_id: str | None = None, status: WorkflowRunStatus | None = None, environment: str | None = None, limit: int = 50) -> list[WorkflowRun]: ...
+    def build_observability_summary(self) -> ObservabilitySummary: ...
+
+    def create_environment(self, request: WorkflowEnvironmentCreateRequest) -> WorkflowEnvironmentDefinition: ...
+    def list_environments(self) -> list[WorkflowEnvironmentDefinition]: ...
+    def get_environment(self, name: str) -> WorkflowEnvironmentDefinition | None: ...
+    def ensure_environment(self, name: str, *, description: str = "", variables: dict[str, Any] | None = None, is_default: bool = False) -> WorkflowEnvironmentDefinition: ...
+    def create_environment_release(self, environment: str, workflow_id: str, workflow_version: int, *, promoted_by: str | None = None) -> WorkflowEnvironmentReleaseDefinition: ...
+    def list_environment_releases(self, environment: str | None = None, workflow_id: str | None = None) -> list[WorkflowEnvironmentReleaseDefinition]: ...
+    def get_environment_release(self, environment: str, workflow_id: str) -> WorkflowEnvironmentReleaseDefinition | None: ...
+
+    def get_trigger_state(self, workflow_id: str, workflow_version: int, node_id: str, environment: str | None = None) -> WorkflowTriggerStateDefinition | None: ...
+    def upsert_trigger_state(self, workflow_id: str, workflow_version: int, node_id: str, *, environment: str | None = None, last_trigger_bucket: str | None = None, last_run_id: str | None = None) -> WorkflowTriggerStateDefinition: ...
+    def list_trigger_states(self) -> list[WorkflowTriggerStateDefinition]: ...
+
+    def create_dead_letter(self, dead_letter: DeadLetterDefinition) -> DeadLetterDefinition: ...
+    def list_dead_letters(self, workflow_id: str | None = None) -> list[DeadLetterDefinition]: ...
 
     def create_user(self, request: UserCreateRequest) -> UserWithToken: ...
     def list_users(self) -> list[UserDefinition]: ...
@@ -161,6 +197,8 @@ class WorkflowRecord(Base):
     state: Mapped[str] = mapped_column(String(20), default=WorkflowState.draft.value)
     name: Mapped[str] = mapped_column(String(255))
     description: Mapped[str] = mapped_column(String, default="")
+    release_notes: Mapped[str] = mapped_column(Text, default="")
+    owner_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     settings: Mapped[dict] = mapped_column(JSON, default=dict)
     nodes: Mapped[list["WorkflowNodeRecord"]] = relationship(back_populates="workflow", cascade="all, delete-orphan", order_by="WorkflowNodeRecord.position")
     edges: Mapped[list["WorkflowEdgeRecord"]] = relationship(back_populates="workflow", cascade="all, delete-orphan", order_by="WorkflowEdgeRecord.position")
@@ -196,6 +234,7 @@ class WorkflowRunRecord(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     workflow_id: Mapped[str] = mapped_column(String(36), index=True)
     workflow_version: Mapped[int] = mapped_column(Integer)
+    environment: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
     status: Mapped[str] = mapped_column(String(20), default=WorkflowRunStatus.queued.value)
     input_payload: Mapped[dict] = mapped_column(JSON, default=dict)
     result_payload: Mapped[dict | None] = mapped_column(JSON, nullable=True)
@@ -210,6 +249,7 @@ class WorkflowRunRecord(Base):
     locked_by: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     execution_state: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    trigger_node_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
     steps: Mapped[list["WorkflowRunStepRecord"]] = relationship(back_populates="run", cascade="all, delete-orphan", order_by="WorkflowRunStepRecord.step_index")
     events: Mapped[list["WorkflowRunEventRecord"]] = relationship(back_populates="run", cascade="all, delete-orphan", order_by="WorkflowRunEventRecord.timestamp")
 
@@ -256,6 +296,81 @@ class WorkflowRunEventRecord(Base):
     step_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
     payload: Mapped[dict] = mapped_column(JSON, default=dict)
     run: Mapped[WorkflowRunRecord] = relationship(back_populates="events")
+
+
+class WorkflowEnvironmentRecord(Base):
+    __tablename__ = "workflow_environments"
+
+    name: Mapped[str] = mapped_column(String(120), primary_key=True)
+    description: Mapped[str] = mapped_column(String, default="")
+    variables: Mapped[dict] = mapped_column(JSON, default=dict)
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class WorkflowEnvironmentReleaseRecord(Base):
+    __tablename__ = "workflow_environment_releases"
+    __table_args__ = (UniqueConstraint("environment", "workflow_id", name="uq_environment_workflow_release"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    environment: Mapped[str] = mapped_column(ForeignKey("workflow_environments.name", ondelete="CASCADE"), index=True)
+    workflow_id: Mapped[str] = mapped_column(String(36), index=True)
+    workflow_version: Mapped[int] = mapped_column(Integer)
+    promoted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    promoted_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
+
+
+class WorkflowTriggerStateRecord(Base):
+    __tablename__ = "workflow_trigger_states"
+    __table_args__ = (UniqueConstraint("workflow_id", "workflow_version", "node_id", "environment", name="uq_trigger_state_scope"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    workflow_id: Mapped[str] = mapped_column(String(36), index=True)
+    workflow_version: Mapped[int] = mapped_column(Integer)
+    node_id: Mapped[str] = mapped_column(String(255), index=True)
+    environment: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
+    last_trigger_bucket: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class WorkflowDeadLetterRecord(Base):
+    __tablename__ = "workflow_dead_letters"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(36), index=True)
+    workflow_id: Mapped[str] = mapped_column(String(36), index=True)
+    workflow_version: Mapped[int] = mapped_column(Integer)
+    step_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    node_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    environment: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
+    error_message: Mapped[str] = mapped_column(String)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class WorkflowCommentRecord(Base):
+    __tablename__ = "workflow_comments"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    workflow_id: Mapped[str] = mapped_column(String(36), index=True)
+    workflow_version: Mapped[int] = mapped_column(Integer, index=True)
+    body: Mapped[str] = mapped_column(Text)
+    author_id: Mapped[str] = mapped_column(String(36), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class AuditLogRecord(Base):
+    __tablename__ = "audit_logs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    action: Mapped[str] = mapped_column(String(120), index=True)
+    actor_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    workflow_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    workflow_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    run_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
 
 class WorkflowUserRecord(Base):
@@ -362,6 +477,8 @@ class SqlAlchemyWorkflowRepository:
                     state=workflow.state.value,
                     name=workflow.name,
                     description=workflow.description,
+                    release_notes=workflow.release_notes,
+                    owner_id=workflow.owner_id,
                     settings=workflow.settings.model_dump(),
                 )
                 session.add(record)
@@ -370,6 +487,8 @@ class SqlAlchemyWorkflowRepository:
                 record.state = workflow.state.value
                 record.name = workflow.name
                 record.description = workflow.description
+                record.release_notes = workflow.release_notes
+                record.owner_id = workflow.owner_id
                 record.settings = workflow.settings.model_dump()
                 session.execute(delete(WorkflowNodeRecord).where(WorkflowNodeRecord.workflow_record_id == record.record_id))
                 session.execute(delete(WorkflowEdgeRecord).where(WorkflowEdgeRecord.workflow_record_id == record.record_id))
@@ -400,6 +519,52 @@ class SqlAlchemyWorkflowRepository:
             ]
             session.commit()
         return workflow
+
+    def create_comment(self, request: WorkflowCommentCreateRequest, *, author_id: str) -> WorkflowCommentDefinition:
+        with self._session_factory() as session:
+            record = WorkflowCommentRecord(
+                id=str(uuid4()),
+                workflow_id=request.workflow_id,
+                workflow_version=request.workflow_version,
+                body=request.body,
+                author_id=author_id,
+                created_at=_utcnow(),
+            )
+            session.add(record)
+            session.commit()
+            return self._to_comment_domain(record)
+
+    def list_comments(self, workflow_id: str, workflow_version: int | None = None) -> list[WorkflowCommentDefinition]:
+        with self._session_factory() as session:
+            statement = select(WorkflowCommentRecord).where(WorkflowCommentRecord.workflow_id == workflow_id).order_by(WorkflowCommentRecord.created_at.desc())
+            if workflow_version is not None:
+                statement = statement.where(WorkflowCommentRecord.workflow_version == workflow_version)
+            return [self._to_comment_domain(record) for record in session.scalars(statement).all()]
+
+    def append_audit_log(self, entry: AuditLogEntry) -> AuditLogEntry:
+        with self._session_factory() as session:
+            record = AuditLogRecord(
+                id=entry.id,
+                action=entry.action,
+                actor_id=entry.actor_id,
+                workflow_id=entry.workflow_id,
+                workflow_version=entry.workflow_version,
+                run_id=entry.run_id,
+                payload=entry.payload,
+                created_at=entry.created_at,
+            )
+            session.add(record)
+            session.commit()
+            return self._to_audit_log_domain(record)
+
+    def list_audit_logs(self, workflow_id: str | None = None, run_id: str | None = None, limit: int = 100) -> list[AuditLogEntry]:
+        with self._session_factory() as session:
+            statement = select(AuditLogRecord).order_by(AuditLogRecord.created_at.desc()).limit(limit)
+            if workflow_id is not None:
+                statement = statement.where(AuditLogRecord.workflow_id == workflow_id)
+            if run_id is not None:
+                statement = statement.where(AuditLogRecord.run_id == run_id)
+            return [self._to_audit_log_domain(record) for record in session.scalars(statement).all()]
 
     def get(self, workflow_id: str, version: int | None = None) -> WorkflowDefinition | None:
         with self._session_factory() as session:
@@ -446,15 +611,17 @@ class SqlAlchemyWorkflowRepository:
             session.commit()
             return self._to_domain(target)
 
-    def create_run(self, workflow: WorkflowDefinition, plan: ExecutionPlan, input_payload: dict, *, idempotency_key: str | None = None, timeout_seconds: int | None = None, retry_of_run_id: str | None = None, resume_from_step_index: int | None = None) -> WorkflowRun:
+    def create_run(self, workflow: WorkflowDefinition, plan: ExecutionPlan, input_payload: dict, *, environment: str | None = None, trigger_node_ids: list[str] | None = None, idempotency_key: str | None = None, timeout_seconds: int | None = None, retry_of_run_id: str | None = None, resume_from_step_index: int | None = None) -> WorkflowRun:
         with self._session_factory() as session:
             record = WorkflowRunRecord(
                 id=str(uuid4()),
                 workflow_id=workflow.id,
                 workflow_version=workflow.version,
+                environment=environment,
                 status=WorkflowRunStatus.queued.value,
                 input_payload=input_payload,
                 created_at=_utcnow(),
+                trigger_node_ids=trigger_node_ids or [],
                 idempotency_key=idempotency_key,
                 timeout_seconds=timeout_seconds,
                 retry_of_run_id=retry_of_run_id,
@@ -496,15 +663,25 @@ class SqlAlchemyWorkflowRepository:
 
     def claim_next_queued_run(self, worker_id: str, lease_seconds: int) -> WorkflowRun | None:
         with self._session_factory() as session:
-            record = session.scalar(select(WorkflowRunRecord).where(WorkflowRunRecord.status == WorkflowRunStatus.queued.value).order_by(WorkflowRunRecord.created_at).options(selectinload(WorkflowRunRecord.steps)))
-            if record is None:
+            candidate_id = session.scalar(select(WorkflowRunRecord.id).where(WorkflowRunRecord.status == WorkflowRunStatus.queued.value).order_by(WorkflowRunRecord.created_at))
+            if candidate_id is None:
                 return None
-            record.status = WorkflowRunStatus.running.value
-            record.started_at = record.started_at or _utcnow()
-            record.locked_by = worker_id
-            record.lease_expires_at = _utcnow() + timedelta(seconds=lease_seconds)
+            now = _utcnow()
+            updated = session.query(WorkflowRunRecord).filter(WorkflowRunRecord.id == candidate_id, WorkflowRunRecord.status == WorkflowRunStatus.queued.value).update(
+                {
+                    WorkflowRunRecord.status: WorkflowRunStatus.running.value,
+                    WorkflowRunRecord.started_at: func.coalesce(WorkflowRunRecord.started_at, now),
+                    WorkflowRunRecord.locked_by: worker_id,
+                    WorkflowRunRecord.lease_expires_at: now + timedelta(seconds=lease_seconds),
+                },
+                synchronize_session=False,
+            )
+            if updated == 0:
+                session.rollback()
+                return None
             session.commit()
-            return self._to_run_domain(record)
+            record = self._get_run_record(session, candidate_id)
+            return None if record is None else self._to_run_domain(record)
 
     def mark_run_pause_requested(self, run_id: str) -> WorkflowRun | None:
         with self._session_factory() as session:
@@ -808,6 +985,206 @@ class SqlAlchemyWorkflowRepository:
             records = session.scalars(select(WorkflowRunEventRecord).where(WorkflowRunEventRecord.run_id == run_id).order_by(WorkflowRunEventRecord.timestamp, _event_ordering())).all()
             return [self._to_run_event_domain(record) for record in records]
 
+    def search_runs(self, *, workflow_id: str | None = None, status: WorkflowRunStatus | None = None, environment: str | None = None, limit: int = 50) -> list[WorkflowRun]:
+        with self._session_factory() as session:
+            statement = select(WorkflowRunRecord).options(selectinload(WorkflowRunRecord.steps)).order_by(WorkflowRunRecord.created_at.desc()).limit(limit)
+            if workflow_id is not None:
+                statement = statement.where(WorkflowRunRecord.workflow_id == workflow_id)
+            if status is not None:
+                statement = statement.where(WorkflowRunRecord.status == status.value)
+            if environment is not None:
+                statement = statement.where(WorkflowRunRecord.environment == environment)
+            return [self._to_run_domain(record) for record in session.scalars(statement).all()]
+
+    def build_observability_summary(self) -> ObservabilitySummary:
+        with self._session_factory() as session:
+            runs = session.scalars(select(WorkflowRunRecord).options(selectinload(WorkflowRunRecord.steps))).all()
+            events = session.scalar(select(func.count()).select_from(WorkflowRunEventRecord)) or 0
+            dead_letters = session.scalar(select(func.count()).select_from(WorkflowDeadLetterRecord)) or 0
+
+        total_duration_seconds = 0.0
+        completed_duration_count = 0
+        prompt_tokens = 0
+        completion_tokens = 0
+        total_tokens = 0
+        queued = running = succeeded = failed = cancelled = 0
+        for run in runs:
+            status = WorkflowRunStatus(run.status)
+            if status == WorkflowRunStatus.queued:
+                queued += 1
+            elif status in {WorkflowRunStatus.running, WorkflowRunStatus.pause_requested, WorkflowRunStatus.paused, WorkflowRunStatus.waiting_human, WorkflowRunStatus.cancelling}:
+                running += 1
+            elif status == WorkflowRunStatus.succeeded:
+                succeeded += 1
+            elif status == WorkflowRunStatus.failed:
+                failed += 1
+            elif status == WorkflowRunStatus.cancelled:
+                cancelled += 1
+
+            if run.started_at is not None and run.finished_at is not None:
+                total_duration_seconds += (run.finished_at - run.started_at).total_seconds()
+                completed_duration_count += 1
+
+            for step in run.steps:
+                usage = _extract_usage(step.output_payload)
+                prompt_tokens += int(usage.get("prompt_tokens", 0) or 0)
+                completion_tokens += int(usage.get("completion_tokens", 0) or 0)
+                total_tokens += int(usage.get("total_tokens", 0) or 0)
+
+        return ObservabilitySummary(
+            total_runs=len(runs),
+            queued_runs=queued,
+            running_runs=running,
+            succeeded_runs=succeeded,
+            failed_runs=failed,
+            cancelled_runs=cancelled,
+            average_duration_seconds=0.0 if completed_duration_count == 0 else total_duration_seconds / completed_duration_count,
+            total_events=int(events),
+            dead_letters=int(dead_letters),
+            llm_total_tokens=total_tokens,
+            llm_prompt_tokens=prompt_tokens,
+            llm_completion_tokens=completion_tokens,
+        )
+
+    def create_environment(self, request: WorkflowEnvironmentCreateRequest) -> WorkflowEnvironmentDefinition:
+        with self._session_factory() as session:
+            if request.is_default:
+                for record in session.scalars(select(WorkflowEnvironmentRecord).where(WorkflowEnvironmentRecord.is_default.is_(True))).all():
+                    record.is_default = False
+            record = WorkflowEnvironmentRecord(
+                name=request.name,
+                description=request.description,
+                variables=request.variables,
+                is_default=request.is_default,
+                created_at=_utcnow(),
+            )
+            session.merge(record)
+            session.commit()
+            return self._to_environment_domain(record)
+
+    def list_environments(self) -> list[WorkflowEnvironmentDefinition]:
+        with self._session_factory() as session:
+            return [self._to_environment_domain(record) for record in session.scalars(select(WorkflowEnvironmentRecord).order_by(WorkflowEnvironmentRecord.name)).all()]
+
+    def get_environment(self, name: str) -> WorkflowEnvironmentDefinition | None:
+        with self._session_factory() as session:
+            record = session.get(WorkflowEnvironmentRecord, name)
+            return None if record is None else self._to_environment_domain(record)
+
+    def ensure_environment(self, name: str, *, description: str = "", variables: dict[str, Any] | None = None, is_default: bool = False) -> WorkflowEnvironmentDefinition:
+        existing = self.get_environment(name)
+        if existing is not None:
+            return existing
+        return self.create_environment(WorkflowEnvironmentCreateRequest(name=name, description=description, variables=variables or {}, is_default=is_default))
+
+    def create_environment_release(self, environment: str, workflow_id: str, workflow_version: int, *, promoted_by: str | None = None) -> WorkflowEnvironmentReleaseDefinition:
+        with self._session_factory() as session:
+            record = session.scalar(select(WorkflowEnvironmentReleaseRecord).where(WorkflowEnvironmentReleaseRecord.environment == environment, WorkflowEnvironmentReleaseRecord.workflow_id == workflow_id))
+            if record is None:
+                record = WorkflowEnvironmentReleaseRecord(
+                    id=str(uuid4()),
+                    environment=environment,
+                    workflow_id=workflow_id,
+                    workflow_version=workflow_version,
+                    promoted_at=_utcnow(),
+                    promoted_by=promoted_by,
+                )
+                session.add(record)
+            else:
+                record.workflow_version = workflow_version
+                record.promoted_at = _utcnow()
+                record.promoted_by = promoted_by
+            session.commit()
+            return self._to_environment_release_domain(record)
+
+    def list_environment_releases(self, environment: str | None = None, workflow_id: str | None = None) -> list[WorkflowEnvironmentReleaseDefinition]:
+        with self._session_factory() as session:
+            statement = select(WorkflowEnvironmentReleaseRecord).order_by(WorkflowEnvironmentReleaseRecord.environment, WorkflowEnvironmentReleaseRecord.workflow_id)
+            if environment is not None:
+                statement = statement.where(WorkflowEnvironmentReleaseRecord.environment == environment)
+            if workflow_id is not None:
+                statement = statement.where(WorkflowEnvironmentReleaseRecord.workflow_id == workflow_id)
+            return [self._to_environment_release_domain(record) for record in session.scalars(statement).all()]
+
+    def get_environment_release(self, environment: str, workflow_id: str) -> WorkflowEnvironmentReleaseDefinition | None:
+        with self._session_factory() as session:
+            record = session.scalar(select(WorkflowEnvironmentReleaseRecord).where(WorkflowEnvironmentReleaseRecord.environment == environment, WorkflowEnvironmentReleaseRecord.workflow_id == workflow_id))
+            return None if record is None else self._to_environment_release_domain(record)
+
+    def get_trigger_state(self, workflow_id: str, workflow_version: int, node_id: str, environment: str | None = None) -> WorkflowTriggerStateDefinition | None:
+        with self._session_factory() as session:
+            statement = select(WorkflowTriggerStateRecord).where(
+                WorkflowTriggerStateRecord.workflow_id == workflow_id,
+                WorkflowTriggerStateRecord.workflow_version == workflow_version,
+                WorkflowTriggerStateRecord.node_id == node_id,
+            )
+            if environment is None:
+                statement = statement.where(WorkflowTriggerStateRecord.environment.is_(None))
+            else:
+                statement = statement.where(WorkflowTriggerStateRecord.environment == environment)
+            record = session.scalar(statement)
+            return None if record is None else self._to_trigger_state_domain(record)
+
+    def upsert_trigger_state(self, workflow_id: str, workflow_version: int, node_id: str, *, environment: str | None = None, last_trigger_bucket: str | None = None, last_run_id: str | None = None) -> WorkflowTriggerStateDefinition:
+        with self._session_factory() as session:
+            statement = select(WorkflowTriggerStateRecord).where(
+                WorkflowTriggerStateRecord.workflow_id == workflow_id,
+                WorkflowTriggerStateRecord.workflow_version == workflow_version,
+                WorkflowTriggerStateRecord.node_id == node_id,
+            )
+            if environment is None:
+                statement = statement.where(WorkflowTriggerStateRecord.environment.is_(None))
+            else:
+                statement = statement.where(WorkflowTriggerStateRecord.environment == environment)
+            record = session.scalar(statement)
+            if record is None:
+                record = WorkflowTriggerStateRecord(
+                    id=str(uuid4()),
+                    workflow_id=workflow_id,
+                    workflow_version=workflow_version,
+                    node_id=node_id,
+                    environment=environment,
+                    last_trigger_bucket=last_trigger_bucket,
+                    last_run_id=last_run_id,
+                    updated_at=_utcnow(),
+                )
+                session.add(record)
+            else:
+                record.last_trigger_bucket = last_trigger_bucket
+                record.last_run_id = last_run_id
+                record.updated_at = _utcnow()
+            session.commit()
+            return self._to_trigger_state_domain(record)
+
+    def list_trigger_states(self) -> list[WorkflowTriggerStateDefinition]:
+        with self._session_factory() as session:
+            return [self._to_trigger_state_domain(record) for record in session.scalars(select(WorkflowTriggerStateRecord).order_by(WorkflowTriggerStateRecord.updated_at.desc())).all()]
+
+    def create_dead_letter(self, dead_letter: DeadLetterDefinition) -> DeadLetterDefinition:
+        with self._session_factory() as session:
+            record = WorkflowDeadLetterRecord(
+                id=dead_letter.id,
+                run_id=dead_letter.run_id,
+                workflow_id=dead_letter.workflow_id,
+                workflow_version=dead_letter.workflow_version,
+                step_index=dead_letter.step_index,
+                node_id=dead_letter.node_id,
+                environment=dead_letter.environment,
+                error_message=dead_letter.error_message,
+                payload=dead_letter.payload,
+                created_at=dead_letter.created_at,
+            )
+            session.add(record)
+            session.commit()
+            return self._to_dead_letter_domain(record)
+
+    def list_dead_letters(self, workflow_id: str | None = None) -> list[DeadLetterDefinition]:
+        with self._session_factory() as session:
+            statement = select(WorkflowDeadLetterRecord).order_by(WorkflowDeadLetterRecord.created_at.desc())
+            if workflow_id is not None:
+                statement = statement.where(WorkflowDeadLetterRecord.workflow_id == workflow_id)
+            return [self._to_dead_letter_domain(record) for record in session.scalars(statement).all()]
+
     def create_user(self, request: UserCreateRequest) -> UserWithToken:
         token = generate_bearer_token()
         record = WorkflowUserRecord(id=str(uuid4()), username=request.username, role=request.role.value, token_hash=hash_token(token), active=True, created_at=_utcnow())
@@ -881,8 +1258,10 @@ class SqlAlchemyWorkflowRepository:
             id=record.workflow_id,
             name=record.name,
             description=record.description,
+            release_notes=record.release_notes,
             version=record.version,
             state=WorkflowState(record.state),
+            owner_id=record.owner_id,
             settings=WorkflowSettings.model_validate(record.settings or {}),
             nodes=[WorkflowNode(id=node.node_key, type=node.type, label=node.label, config=node.config) for node in record.nodes],
             edges=[WorkflowEdge(source=edge.source, target=edge.target, condition_value=edge.condition_value, is_default=edge.is_default, label=edge.label) for edge in record.edges],
@@ -893,6 +1272,7 @@ class SqlAlchemyWorkflowRepository:
             id=record.id,
             workflow_id=record.workflow_id,
             workflow_version=record.workflow_version,
+            environment=record.environment,
             status=WorkflowRunStatus(record.status),
             input_payload=record.input_payload,
             result_payload=record.result_payload,
@@ -907,6 +1287,7 @@ class SqlAlchemyWorkflowRepository:
             locked_by=record.locked_by,
             lease_expires_at=record.lease_expires_at,
             execution_state=record.execution_state,
+            trigger_node_ids=list(record.trigger_node_ids or []),
             steps=[WorkflowRunStep(index=step.step_index, node_id=step.node_id, node_type=step.node_type, label=step.label, status=WorkflowRunStepStatus(step.status), output_payload=step.output_payload, error_message=step.error_message, started_at=step.started_at, finished_at=step.finished_at) for step in record.steps],
         )
 
@@ -921,6 +1302,24 @@ class SqlAlchemyWorkflowRepository:
 
     def _to_user_domain(self, record: WorkflowUserRecord) -> UserDefinition:
         return UserDefinition(id=record.id, username=record.username, role=UserRole(record.role), active=record.active, created_at=record.created_at)
+
+    def _to_comment_domain(self, record: WorkflowCommentRecord) -> WorkflowCommentDefinition:
+        return WorkflowCommentDefinition(id=record.id, workflow_id=record.workflow_id, workflow_version=record.workflow_version, body=record.body, author_id=record.author_id, created_at=record.created_at)
+
+    def _to_audit_log_domain(self, record: AuditLogRecord) -> AuditLogEntry:
+        return AuditLogEntry(id=record.id, action=record.action, actor_id=record.actor_id, workflow_id=record.workflow_id, workflow_version=record.workflow_version, run_id=record.run_id, payload=record.payload, created_at=record.created_at)
+
+    def _to_environment_domain(self, record: WorkflowEnvironmentRecord) -> WorkflowEnvironmentDefinition:
+        return WorkflowEnvironmentDefinition(name=record.name, description=record.description, variables=record.variables, is_default=record.is_default, created_at=record.created_at)
+
+    def _to_environment_release_domain(self, record: WorkflowEnvironmentReleaseRecord) -> WorkflowEnvironmentReleaseDefinition:
+        return WorkflowEnvironmentReleaseDefinition(id=record.id, environment=record.environment, workflow_id=record.workflow_id, workflow_version=record.workflow_version, promoted_at=record.promoted_at, promoted_by=record.promoted_by)
+
+    def _to_trigger_state_domain(self, record: WorkflowTriggerStateRecord) -> WorkflowTriggerStateDefinition:
+        return WorkflowTriggerStateDefinition(id=record.id, workflow_id=record.workflow_id, workflow_version=record.workflow_version, node_id=record.node_id, environment=record.environment, last_trigger_bucket=record.last_trigger_bucket, last_run_id=record.last_run_id, updated_at=record.updated_at)
+
+    def _to_dead_letter_domain(self, record: WorkflowDeadLetterRecord) -> DeadLetterDefinition:
+        return DeadLetterDefinition(id=record.id, run_id=record.run_id, workflow_id=record.workflow_id, workflow_version=record.workflow_version, step_index=record.step_index, node_id=record.node_id, environment=record.environment, error_message=record.error_message, payload=record.payload, created_at=record.created_at)
 
     def _to_knowledge_base_domain(self, record: KnowledgeBaseRecord) -> KnowledgeBaseDefinition:
         return KnowledgeBaseDefinition(id=record.id, name=record.name, description=record.description, created_at=record.created_at, created_by=record.created_by)
@@ -952,6 +1351,20 @@ class SqlAlchemyWorkflowRepository:
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+def _extract_usage(output_payload: dict[str, Any] | None) -> dict[str, int]:
+    if not isinstance(output_payload, dict):
+        return {}
+    usage = output_payload.get("usage")
+    if not isinstance(usage, dict):
+        return {}
+    result: dict[str, int] = {}
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        value = usage.get(key)
+        if isinstance(value, (int, float)):
+            result[key] = int(value)
+    return result
 
 
 def _event_ordering():

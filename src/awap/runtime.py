@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from awap.domain import ApprovalDecision, CredentialSecret, WorkflowDefinition, WorkflowEdge, WorkflowNode
+from awap.domain import ApprovalDecision, CredentialSecret, WorkflowDefinition, WorkflowEdge, WorkflowEnvironmentDefinition, WorkflowNode
 from awap.providers import ProviderRegistry
 
 SubworkflowInvoker = Callable[[str, int | None, dict[str, Any]], dict[str, Any]]
@@ -29,10 +29,11 @@ class WorkflowExecutionEngine:
     def __init__(self, provider_registry: ProviderRegistry) -> None:
         self._provider_registry = provider_registry
 
-    def create_context(self, workflow: WorkflowDefinition, input_payload: dict[str, Any]) -> dict[str, Any]:
+    def create_context(self, workflow: WorkflowDefinition, input_payload: dict[str, Any], environment: WorkflowEnvironmentDefinition | None = None) -> dict[str, Any]:
         return {
             "workflow": {"id": workflow.id, "version": workflow.version, "name": workflow.name},
             "input": input_payload,
+            "environment": None if environment is None else {"name": environment.name, "variables": environment.variables},
             "steps": {},
             "last": None,
             "join_inputs": {},
@@ -43,6 +44,7 @@ class WorkflowExecutionEngine:
     def execute_node(self, node: WorkflowNode, context: dict[str, Any], credential: CredentialSecret | None = None, *, invoke_subworkflow: SubworkflowInvoker | None = None, step_index: int | None = None) -> dict[str, Any]:
         handlers = {
             "manual_trigger": self._execute_manual_trigger,
+            "webhook_trigger": self._execute_manual_trigger,
             "schedule_trigger": self._execute_schedule_trigger,
             "llm_prompt": self._execute_llm_prompt,
             "knowledge_retrieval": self._execute_knowledge_retrieval,
@@ -87,8 +89,9 @@ class WorkflowExecutionEngine:
         node_inputs[source_node_id] = payload
 
     def _execute_manual_trigger(self, node: WorkflowNode, context: dict[str, Any], credential: CredentialSecret | None, invoke_subworkflow: SubworkflowInvoker | None, step_index: int | None) -> dict[str, Any]:
-        del node, credential, invoke_subworkflow, step_index
-        return {"triggered": True, "trigger_type": "manual_trigger", "received_input_keys": sorted(context["input"].keys())}
+        del credential, invoke_subworkflow, step_index
+        trigger_type = node.type
+        return {"triggered": True, "trigger_type": trigger_type, "received_input_keys": sorted(context["input"].keys())}
 
     def _execute_schedule_trigger(self, node: WorkflowNode, context: dict[str, Any], credential: CredentialSecret | None, invoke_subworkflow: SubworkflowInvoker | None, step_index: int | None) -> dict[str, Any]:
         del credential, invoke_subworkflow, step_index

@@ -116,6 +116,7 @@ class WorkflowSettings(BaseModel):
 class WorkflowContent(BaseModel):
     name: str
     description: str = ""
+    release_notes: str = ""
     nodes: list[WorkflowNode]
     edges: list[WorkflowEdge] = Field(default_factory=list)
     settings: WorkflowSettings = Field(default_factory=WorkflowSettings)
@@ -137,6 +138,7 @@ class WorkflowDefinition(WorkflowContent):
     id: str = Field(default_factory=lambda: str(uuid4()))
     version: int = 1
     state: WorkflowState = WorkflowState.draft
+    owner_id: str | None = None
 
     @model_validator(mode="after")
     def ensure_version_is_positive(self) -> WorkflowDefinition:
@@ -145,16 +147,65 @@ class WorkflowDefinition(WorkflowContent):
         return self
 
 
+class WorkflowTemplateDefinition(BaseModel):
+    key: str
+    display_name: str
+    description: str
+    category: str
+    workflow: WorkflowDraftPayload
+
+
 class WorkflowValidationResult(BaseModel):
     valid: bool
     errors: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
 
 
+class WorkflowCommentCreateRequest(BaseModel):
+    workflow_id: str
+    workflow_version: int
+    body: str
+
+
+class WorkflowCommentDefinition(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    workflow_id: str
+    workflow_version: int
+    body: str
+    author_id: str
+    created_at: datetime
+
+
+class AuditLogEntry(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    action: str
+    actor_id: str | None = None
+    workflow_id: str | None = None
+    workflow_version: int | None = None
+    run_id: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+
+
+class WorkflowVersionDiff(BaseModel):
+    workflow_id: str
+    from_version: int
+    to_version: int
+    added_nodes: list[str] = Field(default_factory=list)
+    removed_nodes: list[str] = Field(default_factory=list)
+    changed_nodes: list[str] = Field(default_factory=list)
+    added_edges: list[str] = Field(default_factory=list)
+    removed_edges: list[str] = Field(default_factory=list)
+    changed_edges: list[str] = Field(default_factory=list)
+    from_release_notes: str = ""
+    to_release_notes: str = ""
+
+
 class WorkflowRunRequest(BaseModel):
     input_payload: dict[str, Any] = Field(default_factory=dict)
     idempotency_key: str | None = None
     timeout_seconds: int | None = Field(default=None, ge=1, le=86_400)
+    environment: str | None = None
 
 
 class ProviderDefinition(BaseModel):
@@ -216,6 +267,7 @@ class WorkflowRun(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
     workflow_id: str
     workflow_version: int
+    environment: str | None = None
     status: WorkflowRunStatus = WorkflowRunStatus.queued
     input_payload: dict[str, Any] = Field(default_factory=dict)
     result_payload: dict[str, Any] | None = None
@@ -231,6 +283,7 @@ class WorkflowRun(BaseModel):
     locked_by: str | None = None
     lease_expires_at: datetime | None = None
     execution_state: dict[str, Any] | None = None
+    trigger_node_ids: list[str] = Field(default_factory=list)
 
 
 class WorkflowRunEvent(BaseModel):
@@ -262,6 +315,100 @@ class UserCreateRequest(BaseModel):
 
 class UserWithToken(UserDefinition):
     token: str
+
+
+class WorkflowEnvironmentCreateRequest(BaseModel):
+    name: str
+    description: str = ""
+    variables: dict[str, Any] = Field(default_factory=dict)
+    is_default: bool = False
+
+
+class WorkflowEnvironmentDefinition(BaseModel):
+    name: str
+    description: str = ""
+    variables: dict[str, Any] = Field(default_factory=dict)
+    is_default: bool = False
+    created_at: datetime
+
+
+class WorkflowPromotionRequest(BaseModel):
+    environment: str
+    version: int
+
+
+class WorkflowEnvironmentReleaseDefinition(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    environment: str
+    workflow_id: str
+    workflow_version: int
+    promoted_at: datetime
+    promoted_by: str | None = None
+
+
+class WorkflowTriggerStateDefinition(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    workflow_id: str
+    workflow_version: int
+    node_id: str
+    environment: str | None = None
+    last_trigger_bucket: str | None = None
+    last_run_id: str | None = None
+    updated_at: datetime
+
+
+class DeadLetterDefinition(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    run_id: str
+    workflow_id: str
+    workflow_version: int
+    step_index: int | None = None
+    node_id: str | None = None
+    environment: str | None = None
+    error_message: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+
+
+class ObservabilitySummary(BaseModel):
+    total_runs: int = 0
+    queued_runs: int = 0
+    running_runs: int = 0
+    succeeded_runs: int = 0
+    failed_runs: int = 0
+    cancelled_runs: int = 0
+    average_duration_seconds: float = 0.0
+    total_events: int = 0
+    dead_letters: int = 0
+    llm_total_tokens: int = 0
+    llm_prompt_tokens: int = 0
+    llm_completion_tokens: int = 0
+
+
+class WorkerHealthDefinition(BaseModel):
+    worker_id: str
+    running: bool = True
+    leased_run_id: str | None = None
+    updated_at: datetime
+
+
+class SourceControlStatus(BaseModel):
+    branch: str | None = None
+    head_commit: str | None = None
+    dirty: bool = False
+    changed_files: list[str] = Field(default_factory=list)
+
+
+class WorkflowExportBundle(BaseModel):
+    workflow_id: str
+    versions: list[WorkflowDefinition] = Field(default_factory=list)
+    exported_at: datetime
+
+
+class WorkflowImportRequest(BaseModel):
+    bundle: WorkflowExportBundle
+    as_new_workflow: bool = True
+    name_override: str | None = None
 
 
 class KnowledgeBaseCreateRequest(BaseModel):

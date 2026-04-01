@@ -54,6 +54,14 @@
 
           <section class="stack-section">
             <div class="section-title-row">
+              <h3>Templates</h3>
+              <span class="muted-label">Starters</span>
+            </div>
+            <div id="workflow-template-list" class="stack-list compact-list"></div>
+          </section>
+
+          <section class="stack-section">
+            <div class="section-title-row">
               <h3>Versions</h3>
               <span id="version-caption" class="muted-label">No workflow selected</span>
             </div>
@@ -115,6 +123,14 @@
                 id="workflow-description"
                 rows="3"
                 placeholder="Describe the workflow intent, audience, and operational goal."
+              ></textarea>
+            </label>
+            <label class="field field-wide">
+              <span>Release Notes</span>
+              <textarea
+                id="workflow-release-notes"
+                rows="3"
+                placeholder="Capture what changed in this version and why it matters."
               ></textarea>
             </label>
           </section>
@@ -190,6 +206,14 @@
 
           <section class="stack-section">
             <div class="section-title-row">
+              <h3>Version Diff</h3>
+              <button id="compare-version-button" class="button button-ghost">Compare</button>
+            </div>
+            <pre id="version-diff-output" class="output-box">No version diff loaded.</pre>
+          </section>
+
+          <section class="stack-section">
+            <div class="section-title-row">
               <h3>Run Input</h3>
               <span class="muted-label">JSON payload for the selected version</span>
             </div>
@@ -210,6 +234,25 @@
               <span id="run-event-caption" class="muted-label">No run selected</span>
             </div>
             <div id="run-event-list" class="event-list"></div>
+          </section>
+
+          <section class="stack-section">
+            <div class="section-title-row">
+              <h3>Comments</h3>
+              <button id="save-comment-button" class="button button-ghost">Post</button>
+            </div>
+            <textarea id="comment-input" class="output-box" spellcheck="true" placeholder="Add a teammate note for the selected workflow version."></textarea>
+            <div id="comment-list" class="stack-list compact-list"></div>
+          </section>
+
+          <section class="stack-section">
+            <div class="section-title-row">
+              <h3>Admin View</h3>
+              <span class="muted-label">Health and audit</span>
+            </div>
+            <pre id="operations-summary-output" class="output-box">No operational summary loaded.</pre>
+            <pre id="source-control-output" class="output-box">No source-control data loaded.</pre>
+            <div id="audit-log-list" class="event-list"></div>
           </section>
         </aside>
       </main>

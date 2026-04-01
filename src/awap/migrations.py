@@ -33,6 +33,8 @@ def apply_migrations(engine: Engine) -> None:
         (1, _migration_1_create_schema),
         (2, _migration_2_upgrade_existing_schema),
         (3, _migration_3_add_priority_one_tables),
+        (4, _migration_4_add_priority_two_tables),
+        (5, _migration_5_add_priority_three_tables),
     ]
     for version, migration in migrations:
         if version in existing_versions:
@@ -96,6 +98,22 @@ def _migration_3_add_priority_one_tables(engine: Engine) -> None:
         columns = {column["name"] for column in inspector.get_columns("workflow_run_steps")}
         if "status" in columns:
             return
+
+
+def _migration_4_add_priority_two_tables(engine: Engine) -> None:
+    Base.metadata.create_all(engine)
+    inspector = inspect(engine)
+    if "workflow_runs" in inspector.get_table_names():
+        _ensure_column(engine, inspector, "workflow_runs", "environment", "VARCHAR(120)")
+        _ensure_column(engine, inspector, "workflow_runs", "trigger_node_ids", "JSON")
+
+
+def _migration_5_add_priority_three_tables(engine: Engine) -> None:
+    Base.metadata.create_all(engine)
+    inspector = inspect(engine)
+    if "workflows" in inspector.get_table_names():
+        _ensure_column(engine, inspector, "workflows", "release_notes", "TEXT DEFAULT ''")
+        _ensure_column(engine, inspector, "workflows", "owner_id", "VARCHAR(36)")
 
 
 def _ensure_column(

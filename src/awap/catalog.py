@@ -9,6 +9,12 @@ DEFAULT_NODE_CATALOG: dict[str, NodeTypeDefinition] = {
         display_name="Manual Trigger",
         description="Starts a workflow from a user action.",
     ),
+    "webhook_trigger": NodeTypeDefinition(
+        key="webhook_trigger",
+        category=NodeCategory.trigger,
+        display_name="Webhook Trigger",
+        description="Starts a workflow from an inbound authenticated webhook call.",
+    ),
     "schedule_trigger": NodeTypeDefinition(
         key="schedule_trigger",
         category=NodeCategory.trigger,
