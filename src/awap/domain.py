@@ -1,4 +1,4 @@
-"""Core domain models for workflow authoring, security, and execution."""
+"""Core domain models for workflow authoring, AI capabilities, and execution."""
 
 from __future__ import annotations
 
@@ -29,6 +29,7 @@ class WorkflowRunStatus(StrEnum):
     running = "running"
     pause_requested = "pause_requested"
     paused = "paused"
+    waiting_human = "waiting_human"
     cancelling = "cancelling"
     succeeded = "succeeded"
     failed = "failed"
@@ -38,6 +39,7 @@ class WorkflowRunStatus(StrEnum):
 class WorkflowRunStepStatus(StrEnum):
     pending = "pending"
     running = "running"
+    waiting_human = "waiting_human"
     succeeded = "succeeded"
     failed = "failed"
     skipped = "skipped"
@@ -69,6 +71,17 @@ class UserRole(StrEnum):
     editor = "editor"
     operator = "operator"
     viewer = "viewer"
+
+
+class ApprovalDecision(StrEnum):
+    pending = "pending"
+    approved = "approved"
+    rejected = "rejected"
+
+
+class EvaluationStatus(StrEnum):
+    completed = "completed"
+    failed = "failed"
 
 
 class NodeTypeDefinition(BaseModel):
@@ -217,6 +230,7 @@ class WorkflowRun(BaseModel):
     resume_from_step_index: int | None = None
     locked_by: str | None = None
     lease_expires_at: datetime | None = None
+    execution_state: dict[str, Any] | None = None
 
 
 class WorkflowRunEvent(BaseModel):
@@ -248,6 +262,148 @@ class UserCreateRequest(BaseModel):
 
 class UserWithToken(UserDefinition):
     token: str
+
+
+class KnowledgeBaseCreateRequest(BaseModel):
+    name: str
+    description: str = ""
+
+
+class KnowledgeBaseDefinition(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    name: str
+    description: str = ""
+    created_at: datetime
+    created_by: str | None = None
+
+
+class KnowledgeDocumentCreateRequest(BaseModel):
+    knowledge_base_id: str
+    title: str
+    content: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class KnowledgeDocumentDefinition(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    knowledge_base_id: str
+    title: str
+    content: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    chunk_count: int = 0
+    created_at: datetime
+    created_by: str | None = None
+
+
+class KnowledgeChunk(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    knowledge_base_id: str
+    document_id: str
+    chunk_index: int
+    content: str
+    score: float = 0.0
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    citation: str | None = None
+
+
+class KnowledgeSearchRequest(BaseModel):
+    query: str
+    top_k: int = Field(default=5, ge=1, le=20)
+
+
+class KnowledgeSearchResult(BaseModel):
+    knowledge_base_id: str
+    query: str
+    chunks: list[KnowledgeChunk] = Field(default_factory=list)
+
+
+class ApprovalTaskDefinition(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    run_id: str
+    workflow_id: str
+    workflow_version: int
+    step_index: int
+    node_id: str
+    title: str
+    prompt: str
+    decision: ApprovalDecision = ApprovalDecision.pending
+    decision_payload: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+    decided_at: datetime | None = None
+    decided_by: str | None = None
+
+
+class ApprovalDecisionRequest(BaseModel):
+    decision: ApprovalDecision
+    comment: str = ""
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def ensure_not_pending(self) -> ApprovalDecisionRequest:
+        if self.decision is ApprovalDecision.pending:
+            raise ValueError("Approval decisions cannot remain pending.")
+        return self
+
+
+class EvaluationCase(BaseModel):
+    input_payload: dict[str, Any] = Field(default_factory=dict)
+    expected_contains: list[str] = Field(default_factory=list)
+    blocked_terms: list[str] = Field(default_factory=list)
+
+
+class EvaluationRunCreateRequest(BaseModel):
+    name: str
+    prompt_template: str
+    model: str
+    provider_key: str = "nvidia_build_free_chat"
+    knowledge_base_id: str | None = None
+    mock_response: str | None = None
+    test_cases: list[EvaluationCase] = Field(default_factory=list)
+
+
+class EvaluationCaseResult(BaseModel):
+    index: int
+    input_payload: dict[str, Any] = Field(default_factory=dict)
+    output: str
+    passed: bool
+    score: float
+    reasons: list[str] = Field(default_factory=list)
+
+
+class EvaluationRunDefinition(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    name: str
+    prompt_template: str
+    model: str
+    provider_key: str
+    knowledge_base_id: str | None = None
+    status: EvaluationStatus = EvaluationStatus.completed
+    total_cases: int = 0
+    passed_cases: int = 0
+    average_score: float = 0.0
+    results: list[EvaluationCaseResult] = Field(default_factory=list)
+    created_at: datetime
+    created_by: str | None = None
+
+
+class PromptTemplateCreateRequest(BaseModel):
+    name: str
+    template: str
+    model: str
+    provider_key: str = "nvidia_build_free_chat"
+    description: str = ""
+
+
+class PromptTemplateDefinition(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    name: str
+    template: str
+    model: str
+    provider_key: str
+    description: str = ""
+    version: int = 1
+    created_at: datetime
+    created_by: str | None = None
 
 
 class WorkflowValidator:
@@ -326,8 +482,8 @@ class WorkflowValidator:
                 warnings.append(f"Node '{node.id}' is unreachable from any predecessor.")
             if node.type == "join" and incoming[node.id] < 2:
                 warnings.append(f"Join node '{node.id}' should normally have at least two inputs.")
-            if node.type == "sub_workflow" and node.config.get("workflow_id") == workflow.id:
-                warnings.append(f"Sub-workflow node '{node.id}' references the current workflow id.")
+            if node.type in {"sub_workflow", "for_each"} and node.config.get("workflow_id") == workflow.id:
+                warnings.append(f"Node '{node.id}' references the current workflow id as a sub-workflow.")
 
         if self._has_cycle(workflow):
             errors.append("Workflow graph must be acyclic.")

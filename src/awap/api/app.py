@@ -13,10 +13,22 @@ from awap.auth import require_role
 from awap.catalog import DEFAULT_NODE_CATALOG
 from awap.database import create_database_engine, initialize_database
 from awap.domain import (
+    ApprovalDecision,
+    ApprovalDecisionRequest,
+    ApprovalTaskDefinition,
     CredentialCreateRequest,
     CredentialDefinition,
+    EvaluationRunCreateRequest,
+    EvaluationRunDefinition,
     ExecutionPlan,
+    KnowledgeBaseCreateRequest,
+    KnowledgeBaseDefinition,
+    KnowledgeDocumentCreateRequest,
+    KnowledgeDocumentDefinition,
+    KnowledgeSearchResult,
     NodeTypeDefinition,
+    PromptTemplateCreateRequest,
+    PromptTemplateDefinition,
     ProviderDefinition,
     UserCreateRequest,
     UserDefinition,
@@ -48,22 +60,12 @@ def create_app(database_url: str | None = None, *, worker_count: int = 2) -> Fas
         bootstrap_token=os.getenv("AWAP_BOOTSTRAP_ADMIN_TOKEN", "awap-dev-admin-token"),
     )
 
-    viewer_access = require_role(
-        repository,
-        UserRole.admin,
-        UserRole.editor,
-        UserRole.operator,
-        UserRole.viewer,
-    )
+    viewer_access = require_role(repository, UserRole.admin, UserRole.editor, UserRole.operator, UserRole.viewer)
     editor_access = require_role(repository, UserRole.admin, UserRole.editor)
     operator_access = require_role(repository, UserRole.admin, UserRole.editor, UserRole.operator)
     admin_access = require_role(repository, UserRole.admin)
 
-    app = FastAPI(
-        title="AWAP",
-        version="0.2.0",
-        description="AI Workflow Automation Platform core foundation",
-    )
+    app = FastAPI(title="AWAP", version="0.3.0", description="AI Workflow Automation Platform")
     app.router.on_shutdown.append(service.shutdown)
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
@@ -85,10 +87,7 @@ def create_app(database_url: str | None = None, *, worker_count: int = 2) -> Fas
         return service.list_users()
 
     @app.post("/users", response_model=UserWithToken, status_code=201)
-    def create_user(
-        request: UserCreateRequest,
-        user: UserDefinition = Depends(admin_access),
-    ) -> UserWithToken:
+    def create_user(request: UserCreateRequest, user: UserDefinition = Depends(admin_access)) -> UserWithToken:
         del user
         return service.create_user(request)
 
@@ -108,22 +107,116 @@ def create_app(database_url: str | None = None, *, worker_count: int = 2) -> Fas
         return service.list_credentials()
 
     @app.post("/credentials", response_model=CredentialDefinition, status_code=201)
-    def create_credential(
-        request: CredentialCreateRequest,
-        user: UserDefinition = Depends(editor_access),
-    ) -> CredentialDefinition:
+    def create_credential(request: CredentialCreateRequest, user: UserDefinition = Depends(editor_access)) -> CredentialDefinition:
         return service.create_credential(request, created_by=user.id)
 
     @app.get("/credentials/{credential_id}", response_model=CredentialDefinition)
-    def get_credential(
-        credential_id: str,
-        user: UserDefinition = Depends(editor_access),
-    ) -> CredentialDefinition:
+    def get_credential(credential_id: str, user: UserDefinition = Depends(editor_access)) -> CredentialDefinition:
         del user
         credential = service.get_credential(credential_id)
         if credential is None:
             raise HTTPException(status_code=404, detail="Credential not found.")
         return credential
+
+    @app.get("/knowledge-bases", response_model=list[KnowledgeBaseDefinition])
+    def list_knowledge_bases(user: UserDefinition = Depends(viewer_access)) -> list[KnowledgeBaseDefinition]:
+        del user
+        return service.list_knowledge_bases()
+
+    @app.post("/knowledge-bases", response_model=KnowledgeBaseDefinition, status_code=201)
+    def create_knowledge_base(request: KnowledgeBaseCreateRequest, user: UserDefinition = Depends(editor_access)) -> KnowledgeBaseDefinition:
+        return service.create_knowledge_base(request, created_by=user.id)
+
+    @app.get("/knowledge-bases/{knowledge_base_id}/documents", response_model=list[KnowledgeDocumentDefinition])
+    def list_knowledge_documents(knowledge_base_id: str, user: UserDefinition = Depends(viewer_access)) -> list[KnowledgeDocumentDefinition]:
+        del user
+        return service.list_knowledge_documents(knowledge_base_id)
+
+    @app.post("/knowledge-documents", response_model=KnowledgeDocumentDefinition, status_code=201)
+    def create_knowledge_document(request: KnowledgeDocumentCreateRequest, user: UserDefinition = Depends(editor_access)) -> KnowledgeDocumentDefinition:
+        try:
+            return service.create_knowledge_document(request, created_by=user.id)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="Knowledge base not found.") from error
+
+    @app.get("/knowledge-bases/{knowledge_base_id}/search", response_model=KnowledgeSearchResult)
+    def search_knowledge(
+        knowledge_base_id: str,
+        query: str = Query(..., min_length=1),
+        top_k: int = Query(default=5, ge=1, le=20),
+        user: UserDefinition = Depends(viewer_access),
+    ) -> KnowledgeSearchResult:
+        del user
+        return service.search_knowledge(knowledge_base_id, query, top_k=top_k)
+
+    @app.get("/approval-tasks", response_model=list[ApprovalTaskDefinition])
+    def list_approval_tasks(
+        run_id: str | None = Query(default=None),
+        decision: ApprovalDecision | None = Query(default=None),
+        user: UserDefinition = Depends(operator_access),
+    ) -> list[ApprovalTaskDefinition]:
+        del user
+        return service.list_approval_tasks(run_id=run_id, decision=decision)
+
+    @app.post("/approval-tasks/{approval_task_id}/decision", response_model=ApprovalTaskDefinition)
+    def decide_approval_task(
+        approval_task_id: str,
+        request: ApprovalDecisionRequest,
+        user: UserDefinition = Depends(operator_access),
+    ) -> ApprovalTaskDefinition:
+        try:
+            return service.decide_approval_task(approval_task_id, request, decided_by=user.id)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="Approval task not found.") from error
+
+    @app.get("/prompt-templates", response_model=list[PromptTemplateDefinition])
+    def list_prompt_templates(
+        name: str | None = Query(default=None),
+        user: UserDefinition = Depends(viewer_access),
+    ) -> list[PromptTemplateDefinition]:
+        del user
+        return service.list_prompt_templates(name=name)
+
+    @app.post("/prompt-templates", response_model=PromptTemplateDefinition, status_code=201)
+    def create_prompt_template(
+        request: PromptTemplateCreateRequest,
+        user: UserDefinition = Depends(editor_access),
+    ) -> PromptTemplateDefinition:
+        return service.create_prompt_template(request, created_by=user.id)
+
+    @app.get("/prompt-templates/{prompt_template_id}", response_model=PromptTemplateDefinition)
+    def get_prompt_template(
+        prompt_template_id: str,
+        user: UserDefinition = Depends(viewer_access),
+    ) -> PromptTemplateDefinition:
+        del user
+        prompt_template = service.get_prompt_template(prompt_template_id)
+        if prompt_template is None:
+            raise HTTPException(status_code=404, detail="Prompt template not found.")
+        return prompt_template
+
+    @app.get("/evaluations", response_model=list[EvaluationRunDefinition])
+    def list_evaluations(user: UserDefinition = Depends(viewer_access)) -> list[EvaluationRunDefinition]:
+        del user
+        return service.list_evaluation_runs()
+
+    @app.post("/evaluations", response_model=EvaluationRunDefinition, status_code=201)
+    def create_evaluation(
+        request: EvaluationRunCreateRequest,
+        user: UserDefinition = Depends(editor_access),
+    ) -> EvaluationRunDefinition:
+        return service.create_evaluation_run(request, created_by=user.id)
+
+    @app.get("/evaluations/{evaluation_run_id}", response_model=EvaluationRunDefinition)
+    def get_evaluation(
+        evaluation_run_id: str,
+        user: UserDefinition = Depends(viewer_access),
+    ) -> EvaluationRunDefinition:
+        del user
+        evaluation = service.get_evaluation_run(evaluation_run_id)
+        if evaluation is None:
+            raise HTTPException(status_code=404, detail="Evaluation run not found.")
+        return evaluation
 
     @app.get("/workflows", response_model=list[WorkflowDefinition])
     def list_workflows(user: UserDefinition = Depends(viewer_access)) -> list[WorkflowDefinition]:
@@ -131,49 +224,28 @@ def create_app(database_url: str | None = None, *, worker_count: int = 2) -> Fas
         return service.list_workflows()
 
     @app.post("/workflows", response_model=WorkflowDefinition, status_code=201)
-    def create_workflow(
-        workflow: WorkflowDraftPayload,
-        user: UserDefinition = Depends(editor_access),
-    ) -> WorkflowDefinition:
+    def create_workflow(workflow: WorkflowDraftPayload, user: UserDefinition = Depends(editor_access)) -> WorkflowDefinition:
         del user
         return service.create_workflow(workflow)
 
     @app.get("/workflows/{workflow_id}/versions", response_model=list[WorkflowDefinition])
-    def list_workflow_versions(
-        workflow_id: str,
-        user: UserDefinition = Depends(viewer_access),
-    ) -> list[WorkflowDefinition]:
+    def list_workflow_versions(workflow_id: str, user: UserDefinition = Depends(viewer_access)) -> list[WorkflowDefinition]:
         del user
         try:
             return service.list_workflow_versions(workflow_id)
         except KeyError as error:
             raise HTTPException(status_code=404, detail="Workflow not found.") from error
 
-    @app.post(
-        "/workflows/{workflow_id}/versions",
-        response_model=WorkflowDefinition,
-        status_code=201,
-    )
-    def create_workflow_version(
-        workflow_id: str,
-        workflow: WorkflowDraftPayload,
-        user: UserDefinition = Depends(editor_access),
-    ) -> WorkflowDefinition:
+    @app.post("/workflows/{workflow_id}/versions", response_model=WorkflowDefinition, status_code=201)
+    def create_workflow_version(workflow_id: str, workflow: WorkflowDraftPayload, user: UserDefinition = Depends(editor_access)) -> WorkflowDefinition:
         del user
         try:
             return service.create_workflow_version(workflow_id, workflow)
         except KeyError as error:
             raise HTTPException(status_code=404, detail="Workflow not found.") from error
 
-    @app.post(
-        "/workflows/{workflow_id}/versions/{version}/publish",
-        response_model=WorkflowDefinition,
-    )
-    def publish_workflow(
-        workflow_id: str,
-        version: int,
-        user: UserDefinition = Depends(editor_access),
-    ) -> WorkflowDefinition:
+    @app.post("/workflows/{workflow_id}/versions/{version}/publish", response_model=WorkflowDefinition)
+    def publish_workflow(workflow_id: str, version: int, user: UserDefinition = Depends(editor_access)) -> WorkflowDefinition:
         del user
         try:
             return service.publish_workflow(workflow_id, version)
@@ -183,11 +255,7 @@ def create_app(database_url: str | None = None, *, worker_count: int = 2) -> Fas
             raise HTTPException(status_code=400, detail=str(error)) from error
 
     @app.get("/workflows/{workflow_id}", response_model=WorkflowDefinition)
-    def get_workflow(
-        workflow_id: str,
-        version: int | None = Query(default=None, ge=1),
-        user: UserDefinition = Depends(viewer_access),
-    ) -> WorkflowDefinition:
+    def get_workflow(workflow_id: str, version: int | None = Query(default=None, ge=1), user: UserDefinition = Depends(viewer_access)) -> WorkflowDefinition:
         del user
         workflow = service.get_workflow(workflow_id, version)
         if workflow is None:
@@ -195,11 +263,7 @@ def create_app(database_url: str | None = None, *, worker_count: int = 2) -> Fas
         return workflow
 
     @app.post("/workflows/{workflow_id}/validate", response_model=WorkflowValidationResult)
-    def validate_workflow(
-        workflow_id: str,
-        version: int | None = Query(default=None, ge=1),
-        user: UserDefinition = Depends(viewer_access),
-    ) -> WorkflowValidationResult:
+    def validate_workflow(workflow_id: str, version: int | None = Query(default=None, ge=1), user: UserDefinition = Depends(viewer_access)) -> WorkflowValidationResult:
         del user
         try:
             return service.validate_workflow(workflow_id, version)
@@ -207,11 +271,7 @@ def create_app(database_url: str | None = None, *, worker_count: int = 2) -> Fas
             raise HTTPException(status_code=404, detail="Workflow not found.") from error
 
     @app.post("/workflows/{workflow_id}/plan", response_model=ExecutionPlan)
-    def build_execution_plan(
-        workflow_id: str,
-        version: int | None = Query(default=None, ge=1),
-        user: UserDefinition = Depends(viewer_access),
-    ) -> ExecutionPlan:
+    def build_execution_plan(workflow_id: str, version: int | None = Query(default=None, ge=1), user: UserDefinition = Depends(viewer_access)) -> ExecutionPlan:
         del user
         try:
             return service.build_execution_plan(workflow_id, version)
@@ -221,10 +281,7 @@ def create_app(database_url: str | None = None, *, worker_count: int = 2) -> Fas
             raise HTTPException(status_code=400, detail=str(error)) from error
 
     @app.get("/workflows/{workflow_id}/runs", response_model=list[WorkflowRun])
-    def list_workflow_runs(
-        workflow_id: str,
-        user: UserDefinition = Depends(viewer_access),
-    ) -> list[WorkflowRun]:
+    def list_workflow_runs(workflow_id: str, user: UserDefinition = Depends(viewer_access)) -> list[WorkflowRun]:
         del user
         try:
             return service.list_workflow_runs(workflow_id)
@@ -232,12 +289,7 @@ def create_app(database_url: str | None = None, *, worker_count: int = 2) -> Fas
             raise HTTPException(status_code=404, detail="Workflow not found.") from error
 
     @app.post("/workflows/{workflow_id}/runs", response_model=WorkflowRun, status_code=202)
-    def start_workflow_run(
-        workflow_id: str,
-        run_request: WorkflowRunRequest,
-        version: int | None = Query(default=None, ge=1),
-        user: UserDefinition = Depends(operator_access),
-    ) -> WorkflowRun:
+    def start_workflow_run(workflow_id: str, run_request: WorkflowRunRequest, version: int | None = Query(default=None, ge=1), user: UserDefinition = Depends(operator_access)) -> WorkflowRun:
         del user
         try:
             return service.start_workflow_run(workflow_id, run_request, version)
@@ -247,10 +299,7 @@ def create_app(database_url: str | None = None, *, worker_count: int = 2) -> Fas
             raise HTTPException(status_code=400, detail=str(error)) from error
 
     @app.get("/runs/{run_id}", response_model=WorkflowRun)
-    def get_workflow_run(
-        run_id: str,
-        user: UserDefinition = Depends(viewer_access),
-    ) -> WorkflowRun:
+    def get_workflow_run(run_id: str, user: UserDefinition = Depends(viewer_access)) -> WorkflowRun:
         del user
         run = service.get_workflow_run(run_id)
         if run is None:
@@ -258,10 +307,7 @@ def create_app(database_url: str | None = None, *, worker_count: int = 2) -> Fas
         return run
 
     @app.post("/runs/{run_id}/pause", response_model=WorkflowRun)
-    def pause_workflow_run(
-        run_id: str,
-        user: UserDefinition = Depends(operator_access),
-    ) -> WorkflowRun:
+    def pause_workflow_run(run_id: str, user: UserDefinition = Depends(operator_access)) -> WorkflowRun:
         del user
         try:
             return service.pause_workflow_run(run_id)
@@ -269,10 +315,7 @@ def create_app(database_url: str | None = None, *, worker_count: int = 2) -> Fas
             raise HTTPException(status_code=404, detail="Run not found.") from error
 
     @app.post("/runs/{run_id}/resume", response_model=WorkflowRun)
-    def resume_workflow_run(
-        run_id: str,
-        user: UserDefinition = Depends(operator_access),
-    ) -> WorkflowRun:
+    def resume_workflow_run(run_id: str, user: UserDefinition = Depends(operator_access)) -> WorkflowRun:
         del user
         try:
             return service.resume_workflow_run(run_id)
@@ -280,10 +323,7 @@ def create_app(database_url: str | None = None, *, worker_count: int = 2) -> Fas
             raise HTTPException(status_code=404, detail="Run not found.") from error
 
     @app.post("/runs/{run_id}/cancel", response_model=WorkflowRun)
-    def cancel_workflow_run(
-        run_id: str,
-        user: UserDefinition = Depends(operator_access),
-    ) -> WorkflowRun:
+    def cancel_workflow_run(run_id: str, user: UserDefinition = Depends(operator_access)) -> WorkflowRun:
         del user
         try:
             return service.cancel_workflow_run(run_id)
@@ -291,11 +331,7 @@ def create_app(database_url: str | None = None, *, worker_count: int = 2) -> Fas
             raise HTTPException(status_code=404, detail="Run not found.") from error
 
     @app.post("/runs/{run_id}/retry", response_model=WorkflowRun, status_code=202)
-    def retry_workflow_run(
-        run_id: str,
-        from_failed_step: bool = Query(default=False),
-        user: UserDefinition = Depends(operator_access),
-    ) -> WorkflowRun:
+    def retry_workflow_run(run_id: str, from_failed_step: bool = Query(default=False), user: UserDefinition = Depends(operator_access)) -> WorkflowRun:
         del user
         try:
             return service.retry_workflow_run(run_id, from_failed_step=from_failed_step)
@@ -305,10 +341,7 @@ def create_app(database_url: str | None = None, *, worker_count: int = 2) -> Fas
             raise HTTPException(status_code=400, detail=str(error)) from error
 
     @app.get("/runs/{run_id}/events", response_model=list[WorkflowRunEvent])
-    def list_workflow_run_events(
-        run_id: str,
-        user: UserDefinition = Depends(viewer_access),
-    ) -> list[WorkflowRunEvent]:
+    def list_workflow_run_events(run_id: str, user: UserDefinition = Depends(viewer_access)) -> list[WorkflowRunEvent]:
         del user
         try:
             return service.list_workflow_run_events(run_id)

@@ -32,6 +32,7 @@ def apply_migrations(engine: Engine) -> None:
     migrations: list[tuple[int, Callable[[Engine], None]]] = [
         (1, _migration_1_create_schema),
         (2, _migration_2_upgrade_existing_schema),
+        (3, _migration_3_add_priority_one_tables),
     ]
     for version, migration in migrations:
         if version in existing_versions:
@@ -65,6 +66,7 @@ def _migration_2_upgrade_existing_schema(engine: Engine) -> None:
         _ensure_column(engine, inspector, "workflow_runs", "resume_from_step_index", "INTEGER")
         _ensure_column(engine, inspector, "workflow_runs", "locked_by", "VARCHAR(255)")
         _ensure_column(engine, inspector, "workflow_runs", "lease_expires_at", "DATETIME")
+        _ensure_column(engine, inspector, "workflow_runs", "execution_state", "JSON")
     if "workflow_credentials" in inspector.get_table_names():
         _ensure_column(engine, inspector, "workflow_credentials", "secret_ciphertext", "TEXT")
         _ensure_column(engine, inspector, "workflow_credentials", "created_by", "VARCHAR(36)")
@@ -85,6 +87,15 @@ def _migration_2_upgrade_existing_schema(engine: Engine) -> None:
                     """
                 )
             )
+
+
+def _migration_3_add_priority_one_tables(engine: Engine) -> None:
+    Base.metadata.create_all(engine)
+    inspector = inspect(engine)
+    if "workflow_run_steps" in inspector.get_table_names():
+        columns = {column["name"] for column in inspector.get_columns("workflow_run_steps")}
+        if "status" in columns:
+            return
 
 
 def _ensure_column(

@@ -53,9 +53,28 @@ const defaultConfigByType = {
     prompt_template: "Summarize {{input.text}}",
     mock_response: "Mocked NVIDIA response",
   },
+  knowledge_retrieval: {
+    provider: "knowledge_tool",
+    knowledge_base_id: "",
+    query_template: "Find information about {{input.topic}}",
+    top_k: 3,
+  },
+  ai_agent: {
+    provider: "nvidia_build_free_chat",
+    model: "meta/llama-3.1-8b-instruct",
+    goal_template: "Help with {{input.text}}",
+    max_iterations: 3,
+    tool_sequence: [],
+    enable_reflection: true,
+    reflection_prompt_template: "Reflect on this draft answer and improve it:\n{{last.response}}",
+    mock_response: "Mocked NVIDIA agent response",
+  },
   decision: {
     condition_key: "last.matched",
     equals: true,
+  },
+  approval: {
+    prompt_template: "Approve action for {{input.subject}}?",
   },
   join: {},
   sub_workflow: {
@@ -72,6 +91,18 @@ const defaultConfigByType = {
     method: "GET",
     url: "https://example.com",
     mock_response: { ok: true },
+  },
+  sql_query: {
+    provider: "sqlite_tool",
+    database_path: "/tmp/awap-demo.db",
+    query: "SELECT 1 AS ok",
+    query_type: "select",
+    parameters: [],
+  },
+  file_write: {
+    provider: "file_tool",
+    path: "/tmp/awap-output.txt",
+    content: "{{input.text}}",
   },
   notification: {
     provider: "notification_tool",

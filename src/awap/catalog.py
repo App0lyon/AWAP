@@ -8,7 +8,6 @@ DEFAULT_NODE_CATALOG: dict[str, NodeTypeDefinition] = {
         category=NodeCategory.trigger,
         display_name="Manual Trigger",
         description="Starts a workflow from a user action.",
-        max_outgoing_edges=None,
     ),
     "schedule_trigger": NodeTypeDefinition(
         key="schedule_trigger",
@@ -16,7 +15,6 @@ DEFAULT_NODE_CATALOG: dict[str, NodeTypeDefinition] = {
         display_name="Schedule Trigger",
         description="Starts a workflow on a recurring schedule.",
         required_config_fields=["cron"],
-        max_outgoing_edges=None,
     ),
     "llm_prompt": NodeTypeDefinition(
         key="llm_prompt",
@@ -24,21 +22,39 @@ DEFAULT_NODE_CATALOG: dict[str, NodeTypeDefinition] = {
         display_name="LLM Prompt",
         description="Runs a prompt against a configured model provider.",
         required_config_fields=["prompt_template", "model"],
-        max_outgoing_edges=None,
+    ),
+    "knowledge_retrieval": NodeTypeDefinition(
+        key="knowledge_retrieval",
+        category=NodeCategory.ai,
+        display_name="Knowledge Retrieval",
+        description="Searches a knowledge base and returns ranked chunks with citations.",
+        required_config_fields=["knowledge_base_id", "query_template"],
+    ),
+    "ai_agent": NodeTypeDefinition(
+        key="ai_agent",
+        category=NodeCategory.ai,
+        display_name="AI Agent",
+        description="Runs a lightweight planning and tool-use loop with memory and reflection.",
+        required_config_fields=["goal_template", "model"],
     ),
     "decision": NodeTypeDefinition(
         key="decision",
         category=NodeCategory.logic,
         display_name="Decision",
         description="Routes execution based on workflow state.",
-        max_outgoing_edges=None,
+    ),
+    "approval": NodeTypeDefinition(
+        key="approval",
+        category=NodeCategory.logic,
+        display_name="Approval",
+        description="Pauses execution for a human review decision.",
+        required_config_fields=["prompt_template"],
     ),
     "join": NodeTypeDefinition(
         key="join",
         category=NodeCategory.flow,
         display_name="Join",
         description="Waits for multiple active branches before continuing.",
-        max_outgoing_edges=None,
     ),
     "sub_workflow": NodeTypeDefinition(
         key="sub_workflow",
@@ -46,7 +62,6 @@ DEFAULT_NODE_CATALOG: dict[str, NodeTypeDefinition] = {
         display_name="Sub-Workflow",
         description="Runs another workflow as a nested step.",
         required_config_fields=["workflow_id"],
-        max_outgoing_edges=None,
     ),
     "for_each": NodeTypeDefinition(
         key="for_each",
@@ -54,7 +69,6 @@ DEFAULT_NODE_CATALOG: dict[str, NodeTypeDefinition] = {
         display_name="For Each",
         description="Iterates over a list and runs a sub-workflow for each item.",
         required_config_fields=["items_path", "workflow_id"],
-        max_outgoing_edges=None,
     ),
     "http_request": NodeTypeDefinition(
         key="http_request",
@@ -62,7 +76,20 @@ DEFAULT_NODE_CATALOG: dict[str, NodeTypeDefinition] = {
         display_name="HTTP Request",
         description="Calls an external HTTP endpoint.",
         required_config_fields=["method", "url"],
-        max_outgoing_edges=None,
+    ),
+    "sql_query": NodeTypeDefinition(
+        key="sql_query",
+        category=NodeCategory.action,
+        display_name="SQL Query",
+        description="Executes a SQL query against a configured SQLite database.",
+        required_config_fields=["query"],
+    ),
+    "file_write": NodeTypeDefinition(
+        key="file_write",
+        category=NodeCategory.action,
+        display_name="File Write",
+        description="Writes rendered content to a local file path.",
+        required_config_fields=["path", "content"],
     ),
     "notification": NodeTypeDefinition(
         key="notification",
@@ -70,6 +97,5 @@ DEFAULT_NODE_CATALOG: dict[str, NodeTypeDefinition] = {
         display_name="Notification",
         description="Sends a notification to an end user or operator.",
         required_config_fields=["channel", "message"],
-        max_outgoing_edges=None,
     ),
 }
