@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from awap.auth import require_role
 from awap.catalog import DEFAULT_NODE_CATALOG
 from awap.database import create_database_engine, initialize_database
 from awap.domain import (
@@ -16,6 +18,10 @@ from awap.domain import (
     ExecutionPlan,
     NodeTypeDefinition,
     ProviderDefinition,
+    UserCreateRequest,
+    UserDefinition,
+    UserRole,
+    UserWithToken,
     WorkflowDefinition,
     WorkflowDraftPayload,
     WorkflowRun,
@@ -30,16 +36,33 @@ UI_DIR = Path(__file__).resolve().parent.parent / "ui"
 STATIC_DIR = UI_DIR / "static"
 
 
-def create_app(database_url: str | None = None) -> FastAPI:
+def create_app(database_url: str | None = None, *, worker_count: int = 2) -> FastAPI:
     engine = create_database_engine(database_url)
     initialize_database(engine)
     repository = SqlAlchemyWorkflowRepository(engine)
-    service = WorkflowService(repository=repository, node_catalog=DEFAULT_NODE_CATALOG)
+    service = WorkflowService(
+        repository=repository,
+        node_catalog=DEFAULT_NODE_CATALOG,
+        worker_count=worker_count,
+        bootstrap_username=os.getenv("AWAP_BOOTSTRAP_ADMIN_USERNAME", "admin"),
+        bootstrap_token=os.getenv("AWAP_BOOTSTRAP_ADMIN_TOKEN", "awap-dev-admin-token"),
+    )
+
+    viewer_access = require_role(
+        repository,
+        UserRole.admin,
+        UserRole.editor,
+        UserRole.operator,
+        UserRole.viewer,
+    )
+    editor_access = require_role(repository, UserRole.admin, UserRole.editor)
+    operator_access = require_role(repository, UserRole.admin, UserRole.editor, UserRole.operator)
+    admin_access = require_role(repository, UserRole.admin)
 
     app = FastAPI(
         title="AWAP",
-        version="0.1.0",
-        description="AI Workflow Automation Platform backend foundation",
+        version="0.2.0",
+        description="AI Workflow Automation Platform core foundation",
     )
     app.router.on_shutdown.append(service.shutdown)
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -52,39 +75,75 @@ def create_app(database_url: str | None = None) -> FastAPI:
     def health() -> dict[str, str]:
         return {"status": "ok"}
 
+    @app.get("/auth/me", response_model=UserDefinition)
+    def auth_me(user: UserDefinition = Depends(viewer_access)) -> UserDefinition:
+        return user
+
+    @app.get("/users", response_model=list[UserDefinition])
+    def list_users(user: UserDefinition = Depends(admin_access)) -> list[UserDefinition]:
+        del user
+        return service.list_users()
+
+    @app.post("/users", response_model=UserWithToken, status_code=201)
+    def create_user(
+        request: UserCreateRequest,
+        user: UserDefinition = Depends(admin_access),
+    ) -> UserWithToken:
+        del user
+        return service.create_user(request)
+
     @app.get("/node-types", response_model=list[NodeTypeDefinition])
-    def list_node_types() -> list[NodeTypeDefinition]:
+    def list_node_types(user: UserDefinition = Depends(viewer_access)) -> list[NodeTypeDefinition]:
+        del user
         return service.list_node_types()
 
     @app.get("/providers", response_model=list[ProviderDefinition])
-    def list_providers() -> list[ProviderDefinition]:
+    def list_providers(user: UserDefinition = Depends(viewer_access)) -> list[ProviderDefinition]:
+        del user
         return service.list_providers()
 
     @app.get("/credentials", response_model=list[CredentialDefinition])
-    def list_credentials() -> list[CredentialDefinition]:
+    def list_credentials(user: UserDefinition = Depends(editor_access)) -> list[CredentialDefinition]:
+        del user
         return service.list_credentials()
 
     @app.post("/credentials", response_model=CredentialDefinition, status_code=201)
-    def create_credential(request: CredentialCreateRequest) -> CredentialDefinition:
-        return service.create_credential(request)
+    def create_credential(
+        request: CredentialCreateRequest,
+        user: UserDefinition = Depends(editor_access),
+    ) -> CredentialDefinition:
+        return service.create_credential(request, created_by=user.id)
 
     @app.get("/credentials/{credential_id}", response_model=CredentialDefinition)
-    def get_credential(credential_id: str) -> CredentialDefinition:
+    def get_credential(
+        credential_id: str,
+        user: UserDefinition = Depends(editor_access),
+    ) -> CredentialDefinition:
+        del user
         credential = service.get_credential(credential_id)
         if credential is None:
             raise HTTPException(status_code=404, detail="Credential not found.")
         return credential
 
     @app.get("/workflows", response_model=list[WorkflowDefinition])
-    def list_workflows() -> list[WorkflowDefinition]:
+    def list_workflows(user: UserDefinition = Depends(viewer_access)) -> list[WorkflowDefinition]:
+        del user
         return service.list_workflows()
 
     @app.post("/workflows", response_model=WorkflowDefinition, status_code=201)
-    def create_workflow(workflow: WorkflowDraftPayload) -> WorkflowDefinition:
+    def create_workflow(
+        workflow: WorkflowDraftPayload,
+        user: UserDefinition = Depends(editor_access),
+    ) -> WorkflowDefinition:
+        del user
         return service.create_workflow(workflow)
 
     @app.get("/workflows/{workflow_id}/versions", response_model=list[WorkflowDefinition])
-    def list_workflow_versions(workflow_id: str) -> list[WorkflowDefinition]:
+    def list_workflow_versions(
+        workflow_id: str,
+        user: UserDefinition = Depends(viewer_access),
+    ) -> list[WorkflowDefinition]:
+        del user
         try:
             return service.list_workflow_versions(workflow_id)
         except KeyError as error:
@@ -98,7 +157,9 @@ def create_app(database_url: str | None = None) -> FastAPI:
     def create_workflow_version(
         workflow_id: str,
         workflow: WorkflowDraftPayload,
+        user: UserDefinition = Depends(editor_access),
     ) -> WorkflowDefinition:
+        del user
         try:
             return service.create_workflow_version(workflow_id, workflow)
         except KeyError as error:
@@ -108,7 +169,12 @@ def create_app(database_url: str | None = None) -> FastAPI:
         "/workflows/{workflow_id}/versions/{version}/publish",
         response_model=WorkflowDefinition,
     )
-    def publish_workflow(workflow_id: str, version: int) -> WorkflowDefinition:
+    def publish_workflow(
+        workflow_id: str,
+        version: int,
+        user: UserDefinition = Depends(editor_access),
+    ) -> WorkflowDefinition:
+        del user
         try:
             return service.publish_workflow(workflow_id, version)
         except KeyError as error:
@@ -120,7 +186,9 @@ def create_app(database_url: str | None = None) -> FastAPI:
     def get_workflow(
         workflow_id: str,
         version: int | None = Query(default=None, ge=1),
+        user: UserDefinition = Depends(viewer_access),
     ) -> WorkflowDefinition:
+        del user
         workflow = service.get_workflow(workflow_id, version)
         if workflow is None:
             raise HTTPException(status_code=404, detail="Workflow not found.")
@@ -130,7 +198,9 @@ def create_app(database_url: str | None = None) -> FastAPI:
     def validate_workflow(
         workflow_id: str,
         version: int | None = Query(default=None, ge=1),
+        user: UserDefinition = Depends(viewer_access),
     ) -> WorkflowValidationResult:
+        del user
         try:
             return service.validate_workflow(workflow_id, version)
         except KeyError as error:
@@ -140,7 +210,9 @@ def create_app(database_url: str | None = None) -> FastAPI:
     def build_execution_plan(
         workflow_id: str,
         version: int | None = Query(default=None, ge=1),
+        user: UserDefinition = Depends(viewer_access),
     ) -> ExecutionPlan:
+        del user
         try:
             return service.build_execution_plan(workflow_id, version)
         except KeyError as error:
@@ -149,7 +221,11 @@ def create_app(database_url: str | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(error)) from error
 
     @app.get("/workflows/{workflow_id}/runs", response_model=list[WorkflowRun])
-    def list_workflow_runs(workflow_id: str) -> list[WorkflowRun]:
+    def list_workflow_runs(
+        workflow_id: str,
+        user: UserDefinition = Depends(viewer_access),
+    ) -> list[WorkflowRun]:
+        del user
         try:
             return service.list_workflow_runs(workflow_id)
         except KeyError as error:
@@ -160,7 +236,9 @@ def create_app(database_url: str | None = None) -> FastAPI:
         workflow_id: str,
         run_request: WorkflowRunRequest,
         version: int | None = Query(default=None, ge=1),
+        user: UserDefinition = Depends(operator_access),
     ) -> WorkflowRun:
+        del user
         try:
             return service.start_workflow_run(workflow_id, run_request, version)
         except KeyError as error:
@@ -169,14 +247,69 @@ def create_app(database_url: str | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(error)) from error
 
     @app.get("/runs/{run_id}", response_model=WorkflowRun)
-    def get_workflow_run(run_id: str) -> WorkflowRun:
+    def get_workflow_run(
+        run_id: str,
+        user: UserDefinition = Depends(viewer_access),
+    ) -> WorkflowRun:
+        del user
         run = service.get_workflow_run(run_id)
         if run is None:
             raise HTTPException(status_code=404, detail="Run not found.")
         return run
 
+    @app.post("/runs/{run_id}/pause", response_model=WorkflowRun)
+    def pause_workflow_run(
+        run_id: str,
+        user: UserDefinition = Depends(operator_access),
+    ) -> WorkflowRun:
+        del user
+        try:
+            return service.pause_workflow_run(run_id)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="Run not found.") from error
+
+    @app.post("/runs/{run_id}/resume", response_model=WorkflowRun)
+    def resume_workflow_run(
+        run_id: str,
+        user: UserDefinition = Depends(operator_access),
+    ) -> WorkflowRun:
+        del user
+        try:
+            return service.resume_workflow_run(run_id)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="Run not found.") from error
+
+    @app.post("/runs/{run_id}/cancel", response_model=WorkflowRun)
+    def cancel_workflow_run(
+        run_id: str,
+        user: UserDefinition = Depends(operator_access),
+    ) -> WorkflowRun:
+        del user
+        try:
+            return service.cancel_workflow_run(run_id)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="Run not found.") from error
+
+    @app.post("/runs/{run_id}/retry", response_model=WorkflowRun, status_code=202)
+    def retry_workflow_run(
+        run_id: str,
+        from_failed_step: bool = Query(default=False),
+        user: UserDefinition = Depends(operator_access),
+    ) -> WorkflowRun:
+        del user
+        try:
+            return service.retry_workflow_run(run_id, from_failed_step=from_failed_step)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="Run not found.") from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
     @app.get("/runs/{run_id}/events", response_model=list[WorkflowRunEvent])
-    def list_workflow_run_events(run_id: str) -> list[WorkflowRunEvent]:
+    def list_workflow_run_events(
+        run_id: str,
+        user: UserDefinition = Depends(viewer_access),
+    ) -> list[WorkflowRunEvent]:
+        del user
         try:
             return service.list_workflow_run_events(run_id)
         except KeyError as error:

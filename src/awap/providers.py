@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Any, Protocol
 from urllib import error, request
 
@@ -17,6 +18,7 @@ from awap.domain import (
 from awap.repository import WorkflowRepository
 
 LOGGER = logging.getLogger(__name__)
+NVIDIA_CHAT_COMPLETIONS_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 
 
 class LLMProvider(Protocol):
@@ -29,6 +31,7 @@ class LLMProvider(Protocol):
         prompt: str,
         credential: CredentialSecret | None,
         context: dict[str, Any],
+        config: dict[str, Any],
     ) -> dict[str, Any]:
         ...
 
@@ -54,12 +57,15 @@ class ObservabilityProvider(Protocol):
         ...
 
 
-class LocalEchoLLMProvider:
+class NvidiaBuildFreeLLMProvider:
     definition = ProviderDefinition(
-        key="echo_llm",
+        key="nvidia_build_free_chat",
         kind=ProviderKind.llm,
-        display_name="Echo LLM",
-        description="Local placeholder LLM provider for simulated completions.",
+        display_name="NVIDIA Build Free Chat",
+        description=(
+            "Calls NVIDIA Build hosted chat-completions endpoints using bearer auth. "
+            "Configure models that are available through free Build endpoints."
+        ),
         supported_node_types=["llm_prompt"],
     )
 
@@ -70,14 +76,77 @@ class LocalEchoLLMProvider:
         prompt: str,
         credential: CredentialSecret | None,
         context: dict[str, Any],
+        config: dict[str, Any],
     ) -> dict[str, Any]:
+        del context
+
+        if "mock_response" in config:
+            return {
+                "provider": self.definition.key,
+                "model": model,
+                "prompt": prompt,
+                "response": config["mock_response"],
+                "mocked": True,
+            }
+
+        api_key = self._resolve_api_key(credential)
+        if not api_key:
+            raise RuntimeError(
+                "NVIDIA API key not configured. Set NVIDIA_API_KEY or attach a bearer token credential."
+            )
+
+        temperature = float(config.get("temperature", 0.2))
+        max_tokens = int(config.get("max_tokens", 1024))
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        raw = json.dumps(payload).encode("utf-8")
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        http_request = request.Request(
+            url=NVIDIA_CHAT_COMPLETIONS_URL,
+            data=raw,
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with request.urlopen(http_request, timeout=float(config.get("timeout_seconds", 60))) as response:
+                body = json.loads(response.read().decode("utf-8"))
+        except error.HTTPError as exc:
+            message = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"NVIDIA chat completion failed: {exc.code} {message}") from exc
+        except error.URLError as exc:
+            raise RuntimeError(f"NVIDIA chat completion failed: {exc}") from exc
+
+        choices = body.get("choices") or []
+        message = ""
+        finish_reason = None
+        if choices:
+            message = choices[0].get("message", {}).get("content", "")
+            finish_reason = choices[0].get("finish_reason")
+
         return {
             "provider": self.definition.key,
             "model": model,
             "prompt": prompt,
-            "credential_configured": credential is not None,
-            "response": f"[{model}] Simulated completion.",
+            "response": message,
+            "finish_reason": finish_reason,
+            "usage": body.get("usage", {}),
+            "mocked": False,
         }
+
+    def _resolve_api_key(self, credential: CredentialSecret | None) -> str | None:
+        if credential is not None:
+            if credential.secret_payload.get("bearer_token"):
+                return str(credential.secret_payload["bearer_token"])
+            if credential.secret_payload.get("api_key"):
+                return str(credential.secret_payload["api_key"])
+        return os.getenv("NVIDIA_API_KEY")
 
 
 class HttpToolProvider:
@@ -97,6 +166,7 @@ class HttpToolProvider:
         credential: CredentialSecret | None,
         context: dict[str, Any],
     ) -> dict[str, Any]:
+        del node_type, context
         mock_response = config.get("mock_response")
         if mock_response is not None:
             return {
@@ -114,6 +184,9 @@ class HttpToolProvider:
             bearer_token = secret_payload.get("bearer_token")
             if bearer_token:
                 headers["Authorization"] = f"Bearer {bearer_token}"
+            api_key = secret_payload.get("api_key")
+            if api_key and "Authorization" not in headers:
+                headers["X-API-Key"] = str(api_key)
             extra_headers = secret_payload.get("headers")
             if isinstance(extra_headers, dict):
                 headers.update(extra_headers)
@@ -170,6 +243,7 @@ class NotificationToolProvider:
         credential: CredentialSecret | None,
         context: dict[str, Any],
     ) -> dict[str, Any]:
+        del node_type, context
         return {
             "provider": self.definition.key,
             "delivered": True,
@@ -268,7 +342,9 @@ class ProviderRegistry:
 
 def build_default_provider_registry(repository: WorkflowRepository) -> ProviderRegistry:
     return ProviderRegistry(
-        llm_providers={LocalEchoLLMProvider.definition.key: LocalEchoLLMProvider()},
+        llm_providers={
+            NvidiaBuildFreeLLMProvider.definition.key: NvidiaBuildFreeLLMProvider(),
+        },
         tool_providers={
             HttpToolProvider.definition.key: HttpToolProvider(),
             NotificationToolProvider.definition.key: NotificationToolProvider(),

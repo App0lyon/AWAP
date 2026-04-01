@@ -1,4 +1,4 @@
-"""Core domain models for workflow authoring and validation."""
+"""Core domain models for workflow authoring, security, and execution."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ class NodeCategory(StrEnum):
     ai = "ai"
     logic = "logic"
     action = "action"
+    flow = "flow"
 
 
 class WorkflowState(StrEnum):
@@ -26,8 +27,12 @@ class WorkflowState(StrEnum):
 class WorkflowRunStatus(StrEnum):
     queued = "queued"
     running = "running"
+    pause_requested = "pause_requested"
+    paused = "paused"
+    cancelling = "cancelling"
     succeeded = "succeeded"
     failed = "failed"
+    cancelled = "cancelled"
 
 
 class WorkflowRunStepStatus(StrEnum):
@@ -35,6 +40,9 @@ class WorkflowRunStepStatus(StrEnum):
     running = "running"
     succeeded = "succeeded"
     failed = "failed"
+    skipped = "skipped"
+    cancelled = "cancelled"
+    copied = "copied"
 
 
 class ProviderKind(StrEnum):
@@ -56,6 +64,13 @@ class RunEventLevel(StrEnum):
     error = "error"
 
 
+class UserRole(StrEnum):
+    admin = "admin"
+    editor = "editor"
+    operator = "operator"
+    viewer = "viewer"
+
+
 class NodeTypeDefinition(BaseModel):
     key: str
     category: NodeCategory
@@ -75,6 +90,14 @@ class WorkflowNode(BaseModel):
 class WorkflowEdge(BaseModel):
     source: str
     target: str
+    condition_value: str | int | float | bool | None = None
+    is_default: bool = False
+    label: str = ""
+
+
+class WorkflowSettings(BaseModel):
+    max_concurrent_runs: int = Field(default=3, ge=1, le=100)
+    run_timeout_seconds: int | None = Field(default=None, ge=1, le=86_400)
 
 
 class WorkflowContent(BaseModel):
@@ -82,6 +105,7 @@ class WorkflowContent(BaseModel):
     description: str = ""
     nodes: list[WorkflowNode]
     edges: list[WorkflowEdge] = Field(default_factory=list)
+    settings: WorkflowSettings = Field(default_factory=WorkflowSettings)
     model_config = ConfigDict(str_strip_whitespace=True)
 
     @model_validator(mode="after")
@@ -116,6 +140,8 @@ class WorkflowValidationResult(BaseModel):
 
 class WorkflowRunRequest(BaseModel):
     input_payload: dict[str, Any] = Field(default_factory=dict)
+    idempotency_key: str | None = None
+    timeout_seconds: int | None = Field(default=None, ge=1, le=86_400)
 
 
 class ProviderDefinition(BaseModel):
@@ -141,6 +167,7 @@ class CredentialDefinition(BaseModel):
     provider_key: str | None = None
     description: str = ""
     created_at: datetime
+    created_by: str | None = None
 
 
 class CredentialSecret(CredentialDefinition):
@@ -184,6 +211,12 @@ class WorkflowRun(BaseModel):
     started_at: datetime | None = None
     finished_at: datetime | None = None
     steps: list[WorkflowRunStep] = Field(default_factory=list)
+    idempotency_key: str | None = None
+    timeout_seconds: int | None = None
+    retry_of_run_id: str | None = None
+    resume_from_step_index: int | None = None
+    locked_by: str | None = None
+    lease_expires_at: datetime | None = None
 
 
 class WorkflowRunEvent(BaseModel):
@@ -198,6 +231,23 @@ class WorkflowRunEvent(BaseModel):
     provider_key: str | None = None
     step_index: int | None = None
     payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class UserDefinition(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    username: str
+    role: UserRole = UserRole.viewer
+    active: bool = True
+    created_at: datetime
+
+
+class UserCreateRequest(BaseModel):
+    username: str
+    role: UserRole = UserRole.viewer
+
+
+class UserWithToken(UserDefinition):
+    token: str
 
 
 class WorkflowValidator:
@@ -227,11 +277,11 @@ class WorkflowValidator:
                 field for field in node_type.required_config_fields if field not in node.config
             ]
             if missing_fields:
-                missing_fields_csv = ", ".join(missing_fields)
                 errors.append(
-                    f"Node '{node.id}' is missing required config fields: {missing_fields_csv}."
+                    f"Node '{node.id}' is missing required config fields: {', '.join(missing_fields)}."
                 )
 
+        default_edges_by_source: dict[str, int] = {}
         for edge in workflow.edges:
             if edge.source not in node_map:
                 errors.append(f"Edge source '{edge.source}' does not exist.")
@@ -242,16 +292,22 @@ class WorkflowValidator:
 
             outgoing[edge.source] += 1
             incoming[edge.target] += 1
+            if edge.is_default:
+                default_edges_by_source[edge.source] = default_edges_by_source.get(edge.source, 0) + 1
+
+        for node_id, count in default_edges_by_source.items():
+            if count > 1:
+                errors.append(f"Node '{node_id}' cannot define more than one default edge.")
 
         trigger_nodes = [
-            node for node in workflow.nodes if self._node_catalog.get(node.type, None)
+            node
+            for node in workflow.nodes
+            if self._node_catalog.get(node.type) is not None
             and self._node_catalog[node.type].category is NodeCategory.trigger
         ]
 
         if not trigger_nodes:
             errors.append("Workflow must include at least one trigger node.")
-        elif len(trigger_nodes) > 1:
-            warnings.append("Workflow currently contains multiple trigger nodes.")
 
         for node in workflow.nodes:
             definition = self._node_catalog.get(node.type)
@@ -263,12 +319,15 @@ class WorkflowValidator:
                 definition.max_outgoing_edges is not None
                 and outgoing[node.id] > definition.max_outgoing_edges
             ):
-                max_edges = definition.max_outgoing_edges
                 errors.append(
-                    f"Node '{node.id}' exceeds max outgoing edges ({max_edges})."
+                    f"Node '{node.id}' exceeds max outgoing edges ({definition.max_outgoing_edges})."
                 )
             if definition.category is not NodeCategory.trigger and incoming[node.id] == 0:
                 warnings.append(f"Node '{node.id}' is unreachable from any predecessor.")
+            if node.type == "join" and incoming[node.id] < 2:
+                warnings.append(f"Join node '{node.id}' should normally have at least two inputs.")
+            if node.type == "sub_workflow" and node.config.get("workflow_id") == workflow.id:
+                warnings.append(f"Sub-workflow node '{node.id}' references the current workflow id.")
 
         if self._has_cycle(workflow):
             errors.append("Workflow graph must be acyclic.")

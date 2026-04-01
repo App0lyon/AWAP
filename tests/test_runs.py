@@ -5,6 +5,8 @@ from fastapi.testclient import TestClient
 
 from awap.api.app import create_app
 
+AUTH_HEADERS = {"Authorization": "Bearer awap-dev-admin-token"}
+
 
 def _database_url(tmp_path: Path) -> str:
     return f"sqlite:///{tmp_path / 'awap-runs.db'}"
@@ -15,7 +17,7 @@ def _poll_run(client: TestClient, run_id: str, timeout_seconds: float = 5.0) -> 
     latest_response: dict | None = None
 
     while time.time() < deadline:
-        response = client.get(f"/runs/{run_id}")
+        response = client.get(f"/runs/{run_id}", headers=AUTH_HEADERS)
         assert response.status_code == 200
         latest_response = response.json()
         if latest_response["status"] in {"succeeded", "failed"}:
@@ -47,15 +49,20 @@ def test_start_run_executes_published_version_by_default(tmp_path: Path) -> None
     created_v1 = client.post(
         "/workflows",
         json=_publishable_workflow_payload("Order pipeline", "Published message"),
+        headers=AUTH_HEADERS,
     )
     workflow_id = created_v1.json()["id"]
 
-    publish_v1 = client.post(f"/workflows/{workflow_id}/versions/1/publish")
+    publish_v1 = client.post(
+        f"/workflows/{workflow_id}/versions/1/publish",
+        headers=AUTH_HEADERS,
+    )
     assert publish_v1.status_code == 200
 
     created_v2 = client.post(
         f"/workflows/{workflow_id}/versions",
         json=_publishable_workflow_payload("Order pipeline draft", "Draft message"),
+        headers=AUTH_HEADERS,
     )
     assert created_v2.status_code == 201
     assert created_v2.json()["version"] == 2
@@ -63,6 +70,7 @@ def test_start_run_executes_published_version_by_default(tmp_path: Path) -> None
     started = client.post(
         f"/workflows/{workflow_id}/runs",
         json={"input_payload": {"customer": "Ada"}},
+        headers=AUTH_HEADERS,
     )
     assert started.status_code == 202
     run_id = started.json()["id"]
@@ -82,18 +90,21 @@ def test_run_can_target_specific_draft_version(tmp_path: Path) -> None:
     created_v1 = client.post(
         "/workflows",
         json=_publishable_workflow_payload("Support flow", "Stable message"),
+        headers=AUTH_HEADERS,
     )
     workflow_id = created_v1.json()["id"]
 
     created_v2 = client.post(
         f"/workflows/{workflow_id}/versions",
         json=_publishable_workflow_payload("Support flow v2", "Draft message"),
+        headers=AUTH_HEADERS,
     )
     assert created_v2.status_code == 201
 
     started = client.post(
         f"/workflows/{workflow_id}/runs?version=2",
         json={"input_payload": {"ticket": "123"}},
+        headers=AUTH_HEADERS,
     )
     assert started.status_code == 202
     run_id = started.json()["id"]
@@ -125,10 +136,15 @@ def test_run_failure_is_tracked_per_step_and_job(tmp_path: Path) -> None:
             ],
             "edges": [{"source": "start", "target": "call_api"}],
         },
+        headers=AUTH_HEADERS,
     )
     workflow_id = created.json()["id"]
 
-    started = client.post(f"/workflows/{workflow_id}/runs", json={"input_payload": {}})
+    started = client.post(
+        f"/workflows/{workflow_id}/runs",
+        json={"input_payload": {}},
+        headers=AUTH_HEADERS,
+    )
     assert started.status_code == 202
     run_id = started.json()["id"]
 
@@ -138,6 +154,6 @@ def test_run_failure_is_tracked_per_step_and_job(tmp_path: Path) -> None:
     assert completed["steps"][0]["status"] == "succeeded"
     assert completed["steps"][1]["status"] == "failed"
 
-    listed = client.get(f"/workflows/{workflow_id}/runs")
+    listed = client.get(f"/workflows/{workflow_id}/runs", headers=AUTH_HEADERS)
     assert listed.status_code == 200
     assert listed.json()[0]["id"] == run_id

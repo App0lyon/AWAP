@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Protocol
 from uuid import uuid4
 
 from sqlalchemy import (
+    JSON,
+    Boolean,
     DateTime,
     Engine,
     ForeignKey,
     Integer,
     String,
+    Text,
     UniqueConstraint,
+    case,
     delete,
     func,
     select,
@@ -26,7 +30,6 @@ from sqlalchemy.orm import (
     selectinload,
     sessionmaker,
 )
-from sqlalchemy.types import JSON
 
 from awap.domain import (
     CredentialCreateRequest,
@@ -35,6 +38,10 @@ from awap.domain import (
     CredentialSecret,
     ExecutionPlan,
     RunEventLevel,
+    UserCreateRequest,
+    UserDefinition,
+    UserRole,
+    UserWithToken,
     WorkflowDefinition,
     WorkflowEdge,
     WorkflowNode,
@@ -43,8 +50,10 @@ from awap.domain import (
     WorkflowRunStatus,
     WorkflowRunStep,
     WorkflowRunStepStatus,
+    WorkflowSettings,
     WorkflowState,
 )
+from awap.security import decrypt_secret_payload, encrypt_secret_payload, generate_bearer_token, hash_token
 
 
 class WorkflowRepository(Protocol):
@@ -71,6 +80,11 @@ class WorkflowRepository(Protocol):
         workflow: WorkflowDefinition,
         plan: ExecutionPlan,
         input_payload: dict,
+        *,
+        idempotency_key: str | None = None,
+        timeout_seconds: int | None = None,
+        retry_of_run_id: str | None = None,
+        resume_from_step_index: int | None = None,
     ) -> WorkflowRun:
         ...
 
@@ -80,7 +94,37 @@ class WorkflowRepository(Protocol):
     def list_runs(self, workflow_id: str) -> list[WorkflowRun]:
         ...
 
-    def mark_run_running(self, run_id: str) -> WorkflowRun | None:
+    def find_run_by_idempotency_key(self, workflow_id: str, key: str) -> WorkflowRun | None:
+        ...
+
+    def count_active_runs(self, workflow_id: str) -> int:
+        ...
+
+    def claim_next_queued_run(self, worker_id: str, lease_seconds: int) -> WorkflowRun | None:
+        ...
+
+    def mark_run_pause_requested(self, run_id: str) -> WorkflowRun | None:
+        ...
+
+    def mark_run_paused(self, run_id: str, worker_id: str | None = None) -> WorkflowRun | None:
+        ...
+
+    def resume_run(self, run_id: str) -> WorkflowRun | None:
+        ...
+
+    def mark_run_cancel_requested(self, run_id: str) -> WorkflowRun | None:
+        ...
+
+    def mark_run_running(self, run_id: str, worker_id: str | None = None) -> WorkflowRun | None:
+        ...
+
+    def mark_run_succeeded(self, run_id: str, result_payload: dict) -> WorkflowRun | None:
+        ...
+
+    def mark_run_failed(self, run_id: str, error_message: str) -> WorkflowRun | None:
+        ...
+
+    def mark_run_cancelled(self, run_id: str, error_message: str | None = None) -> WorkflowRun | None:
         ...
 
     def mark_step_running(self, run_id: str, step_index: int) -> WorkflowRun | None:
@@ -102,13 +146,21 @@ class WorkflowRepository(Protocol):
     ) -> WorkflowRun | None:
         ...
 
-    def mark_run_succeeded(self, run_id: str, result_payload: dict) -> WorkflowRun | None:
+    def mark_step_cancelled(self, run_id: str, step_index: int, message: str) -> WorkflowRun | None:
         ...
 
-    def mark_run_failed(self, run_id: str, error_message: str) -> WorkflowRun | None:
+    def mark_step_skipped(self, run_id: str, step_index: int, message: str) -> WorkflowRun | None:
         ...
 
-    def create_credential(self, request: CredentialCreateRequest) -> CredentialDefinition:
+    def mark_step_copied(self, run_id: str, step_index: int, output_payload: dict) -> WorkflowRun | None:
+        ...
+
+    def create_credential(
+        self,
+        request: CredentialCreateRequest,
+        *,
+        created_by: str | None = None,
+    ) -> CredentialDefinition:
         ...
 
     def list_credentials(self) -> list[CredentialDefinition]:
@@ -138,6 +190,21 @@ class WorkflowRepository(Protocol):
     def list_run_events(self, run_id: str) -> list[WorkflowRunEvent]:
         ...
 
+    def create_user(self, request: UserCreateRequest) -> UserWithToken:
+        ...
+
+    def list_users(self) -> list[UserDefinition]:
+        ...
+
+    def get_user(self, user_id: str) -> UserDefinition | None:
+        ...
+
+    def get_user_by_token(self, token: str) -> UserDefinition | None:
+        ...
+
+    def ensure_bootstrap_user(self, username: str, token: str, role: UserRole) -> UserDefinition:
+        ...
+
 
 class Base(DeclarativeBase):
     pass
@@ -153,6 +220,7 @@ class WorkflowRecord(Base):
     state: Mapped[str] = mapped_column(String(20), default=WorkflowState.draft.value)
     name: Mapped[str] = mapped_column(String(255))
     description: Mapped[str] = mapped_column(String, default="")
+    settings: Mapped[dict] = mapped_column(JSON, default=dict)
     nodes: Mapped[list[WorkflowNodeRecord]] = relationship(
         back_populates="workflow",
         cascade="all, delete-orphan",
@@ -192,6 +260,9 @@ class WorkflowEdgeRecord(Base):
     position: Mapped[int] = mapped_column(Integer)
     source: Mapped[str] = mapped_column(String(255))
     target: Mapped[str] = mapped_column(String(255))
+    condition_value: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False)
+    label: Mapped[str] = mapped_column(String(255), default="")
     workflow: Mapped[WorkflowRecord] = relationship(back_populates="edges")
 
 
@@ -208,6 +279,12 @@ class WorkflowRunRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    timeout_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    retry_of_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    resume_from_step_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    locked_by: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     steps: Mapped[list[WorkflowRunStepRecord]] = relationship(
         back_populates="run",
         cascade="all, delete-orphan",
@@ -248,8 +325,9 @@ class WorkflowCredentialRecord(Base):
     kind: Mapped[str] = mapped_column(String(30), default=CredentialKind.generic.value)
     provider_key: Mapped[str | None] = mapped_column(String(100), nullable=True)
     description: Mapped[str] = mapped_column(String, default="")
-    secret_payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    secret_ciphertext: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
 
 
 class WorkflowRunEventRecord(Base):
@@ -272,6 +350,17 @@ class WorkflowRunEventRecord(Base):
     run: Mapped[WorkflowRunRecord] = relationship(back_populates="events")
 
 
+class WorkflowUserRecord(Base):
+    __tablename__ = "workflow_users"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    username: Mapped[str] = mapped_column(String(255), unique=True)
+    role: Mapped[str] = mapped_column(String(30), default=UserRole.viewer.value)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class SqlAlchemyWorkflowRepository:
     def __init__(self, engine: Engine) -> None:
         self._session_factory = sessionmaker(bind=engine, expire_on_commit=False)
@@ -291,15 +380,15 @@ class SqlAlchemyWorkflowRepository:
                     state=workflow.state.value,
                     name=workflow.name,
                     description=workflow.description,
+                    settings=workflow.settings.model_dump(),
                 )
                 session.add(record)
                 session.flush()
             else:
-                record.workflow_id = workflow.id
-                record.version = workflow.version
                 record.state = workflow.state.value
                 record.name = workflow.name
                 record.description = workflow.description
+                record.settings = workflow.settings.model_dump()
                 session.execute(
                     delete(WorkflowNodeRecord).where(
                         WorkflowNodeRecord.workflow_record_id == record.record_id
@@ -329,6 +418,11 @@ class SqlAlchemyWorkflowRepository:
                     position=index,
                     source=edge.source,
                     target=edge.target,
+                    condition_value=None
+                    if edge.condition_value is None
+                    else str(edge.condition_value),
+                    is_default=edge.is_default,
+                    label=edge.label,
                 )
                 for index, edge in enumerate(workflow.edges)
             ]
@@ -362,14 +456,12 @@ class SqlAlchemyWorkflowRepository:
                 )
                 .order_by(WorkflowRecord.name, WorkflowRecord.version.desc())
             ).all()
-            latest_records: dict[str, WorkflowRecord] = {}
+            latest: dict[str, WorkflowRecord] = {}
             for record in records:
-                existing = latest_records.get(record.workflow_id)
+                existing = latest.get(record.workflow_id)
                 if existing is None or record.version > existing.version:
-                    latest_records[record.workflow_id] = record
-
-            latest_versions = sorted(latest_records.values(), key=lambda item: item.name.lower())
-            return [self._to_domain(record) for record in latest_versions]
+                    latest[record.workflow_id] = record
+            return [self._to_domain(item) for item in sorted(latest.values(), key=lambda r: r.name.lower())]
 
     def list_versions(self, workflow_id: str) -> list[WorkflowDefinition]:
         with self._session_factory() as session:
@@ -406,7 +498,7 @@ class SqlAlchemyWorkflowRepository:
             if not records:
                 return None
 
-            target_record: WorkflowRecord | None = None
+            target: WorkflowRecord | None = None
             for record in records:
                 record.state = (
                     WorkflowState.published.value
@@ -414,19 +506,24 @@ class SqlAlchemyWorkflowRepository:
                     else WorkflowState.draft.value
                 )
                 if record.version == version:
-                    target_record = record
+                    target = record
 
-            if target_record is None:
+            if target is None:
                 return None
 
             session.commit()
-            return self._to_domain(target_record)
+            return self._to_domain(target)
 
     def create_run(
         self,
         workflow: WorkflowDefinition,
         plan: ExecutionPlan,
         input_payload: dict,
+        *,
+        idempotency_key: str | None = None,
+        timeout_seconds: int | None = None,
+        retry_of_run_id: str | None = None,
+        resume_from_step_index: int | None = None,
     ) -> WorkflowRun:
         with self._session_factory() as session:
             record = WorkflowRunRecord(
@@ -436,6 +533,10 @@ class SqlAlchemyWorkflowRepository:
                 status=WorkflowRunStatus.queued.value,
                 input_payload=input_payload,
                 created_at=_utcnow(),
+                idempotency_key=idempotency_key,
+                timeout_seconds=timeout_seconds,
+                retry_of_run_id=retry_of_run_id,
+                resume_from_step_index=resume_from_step_index,
                 steps=[
                     WorkflowRunStepRecord(
                         step_index=step.index,
@@ -467,15 +568,130 @@ class SqlAlchemyWorkflowRepository:
             ).all()
             return [self._to_run_domain(record) for record in records]
 
-    def mark_run_running(self, run_id: str) -> WorkflowRun | None:
+    def find_run_by_idempotency_key(self, workflow_id: str, key: str) -> WorkflowRun | None:
+        with self._session_factory() as session:
+            record = session.scalar(
+                select(WorkflowRunRecord)
+                .where(
+                    WorkflowRunRecord.workflow_id == workflow_id,
+                    WorkflowRunRecord.idempotency_key == key,
+                )
+                .options(selectinload(WorkflowRunRecord.steps))
+                .order_by(WorkflowRunRecord.created_at.desc())
+            )
+            return None if record is None else self._to_run_domain(record)
+
+    def count_active_runs(self, workflow_id: str) -> int:
+        with self._session_factory() as session:
+            return session.scalar(
+                select(func.count())
+                .select_from(WorkflowRunRecord)
+                .where(
+                    WorkflowRunRecord.workflow_id == workflow_id,
+                    WorkflowRunRecord.status.in_(
+                        [
+                            WorkflowRunStatus.queued.value,
+                            WorkflowRunStatus.running.value,
+                            WorkflowRunStatus.pause_requested.value,
+                            WorkflowRunStatus.paused.value,
+                            WorkflowRunStatus.cancelling.value,
+                        ]
+                    ),
+                )
+            ) or 0
+
+    def claim_next_queued_run(self, worker_id: str, lease_seconds: int) -> WorkflowRun | None:
+        with self._session_factory() as session:
+            record = session.scalar(
+                select(WorkflowRunRecord)
+                .where(WorkflowRunRecord.status == WorkflowRunStatus.queued.value)
+                .order_by(WorkflowRunRecord.created_at)
+                .options(selectinload(WorkflowRunRecord.steps))
+            )
+            if record is None:
+                return None
+            record.status = WorkflowRunStatus.running.value
+            record.started_at = record.started_at or _utcnow()
+            record.locked_by = worker_id
+            record.lease_expires_at = _utcnow() + timedelta(seconds=lease_seconds)
+            session.commit()
+            return self._to_run_domain(record)
+
+    def mark_run_pause_requested(self, run_id: str) -> WorkflowRun | None:
+        with self._session_factory() as session:
+            record = self._get_run_record(session, run_id)
+            if record is None:
+                return None
+            if record.status == WorkflowRunStatus.queued.value:
+                record.status = WorkflowRunStatus.paused.value
+            elif record.status == WorkflowRunStatus.running.value:
+                record.status = WorkflowRunStatus.pause_requested.value
+            session.commit()
+            return self._to_run_domain(record)
+
+    def mark_run_paused(self, run_id: str, worker_id: str | None = None) -> WorkflowRun | None:
+        with self._session_factory() as session:
+            record = self._get_run_record(session, run_id)
+            if record is None:
+                return None
+            record.status = WorkflowRunStatus.paused.value
+            if worker_id is not None:
+                record.locked_by = worker_id
+            session.commit()
+            return self._to_run_domain(record)
+
+    def resume_run(self, run_id: str) -> WorkflowRun | None:
+        with self._session_factory() as session:
+            record = self._get_run_record(session, run_id)
+            if record is None:
+                return None
+            if record.status == WorkflowRunStatus.paused.value:
+                if record.locked_by:
+                    record.status = WorkflowRunStatus.running.value
+                else:
+                    record.status = WorkflowRunStatus.queued.value
+            session.commit()
+            return self._to_run_domain(record)
+
+    def mark_run_cancel_requested(self, run_id: str) -> WorkflowRun | None:
+        with self._session_factory() as session:
+            record = self._get_run_record(session, run_id)
+            if record is None:
+                return None
+            if record.status in {
+                WorkflowRunStatus.queued.value,
+                WorkflowRunStatus.paused.value,
+            }:
+                record.status = WorkflowRunStatus.cancelled.value
+                record.finished_at = _utcnow()
+            elif record.status in {
+                WorkflowRunStatus.running.value,
+                WorkflowRunStatus.pause_requested.value,
+            }:
+                record.status = WorkflowRunStatus.cancelling.value
+            session.commit()
+            return self._to_run_domain(record)
+
+    def mark_run_running(self, run_id: str, worker_id: str | None = None) -> WorkflowRun | None:
         with self._session_factory() as session:
             record = self._get_run_record(session, run_id)
             if record is None:
                 return None
             record.status = WorkflowRunStatus.running.value
-            record.started_at = _utcnow()
+            record.started_at = record.started_at or _utcnow()
+            if worker_id is not None:
+                record.locked_by = worker_id
             session.commit()
             return self._to_run_domain(record)
+
+    def mark_run_succeeded(self, run_id: str, result_payload: dict) -> WorkflowRun | None:
+        return self._update_run_terminal(run_id, WorkflowRunStatus.succeeded, result_payload, None)
+
+    def mark_run_failed(self, run_id: str, error_message: str) -> WorkflowRun | None:
+        return self._update_run_terminal(run_id, WorkflowRunStatus.failed, None, error_message)
+
+    def mark_run_cancelled(self, run_id: str, error_message: str | None = None) -> WorkflowRun | None:
+        return self._update_run_terminal(run_id, WorkflowRunStatus.cancelled, None, error_message)
 
     def mark_step_running(self, run_id: str, step_index: int) -> WorkflowRun | None:
         return self._update_step(
@@ -513,13 +729,39 @@ class SqlAlchemyWorkflowRepository:
             finished=True,
         )
 
-    def mark_run_succeeded(self, run_id: str, result_payload: dict) -> WorkflowRun | None:
-        return self._update_run_terminal(run_id, WorkflowRunStatus.succeeded, result_payload, None)
+    def mark_step_cancelled(self, run_id: str, step_index: int, message: str) -> WorkflowRun | None:
+        return self._update_step(
+            run_id=run_id,
+            step_index=step_index,
+            status=WorkflowRunStepStatus.cancelled,
+            error_message=message,
+            finished=True,
+        )
 
-    def mark_run_failed(self, run_id: str, error_message: str) -> WorkflowRun | None:
-        return self._update_run_terminal(run_id, WorkflowRunStatus.failed, None, error_message)
+    def mark_step_skipped(self, run_id: str, step_index: int, message: str) -> WorkflowRun | None:
+        return self._update_step(
+            run_id=run_id,
+            step_index=step_index,
+            status=WorkflowRunStepStatus.skipped,
+            error_message=message,
+            finished=True,
+        )
 
-    def create_credential(self, request: CredentialCreateRequest) -> CredentialDefinition:
+    def mark_step_copied(self, run_id: str, step_index: int, output_payload: dict) -> WorkflowRun | None:
+        return self._update_step(
+            run_id=run_id,
+            step_index=step_index,
+            status=WorkflowRunStepStatus.copied,
+            output_payload=output_payload,
+            finished=True,
+        )
+
+    def create_credential(
+        self,
+        request: CredentialCreateRequest,
+        *,
+        created_by: str | None = None,
+    ) -> CredentialDefinition:
         with self._session_factory() as session:
             record = WorkflowCredentialRecord(
                 id=str(uuid4()),
@@ -527,8 +769,9 @@ class SqlAlchemyWorkflowRepository:
                 kind=request.kind.value,
                 provider_key=request.provider_key,
                 description=request.description,
-                secret_payload=request.secret_payload,
+                secret_ciphertext=encrypt_secret_payload(request.secret_payload),
                 created_at=_utcnow(),
+                created_by=created_by,
             )
             session.add(record)
             session.commit()
@@ -587,9 +830,70 @@ class SqlAlchemyWorkflowRepository:
             records = session.scalars(
                 select(WorkflowRunEventRecord)
                 .where(WorkflowRunEventRecord.run_id == run_id)
-                .order_by(WorkflowRunEventRecord.timestamp)
+                .order_by(WorkflowRunEventRecord.timestamp, _event_ordering())
             ).all()
             return [self._to_run_event_domain(record) for record in records]
+
+    def create_user(self, request: UserCreateRequest) -> UserWithToken:
+        token = generate_bearer_token()
+        record = WorkflowUserRecord(
+            id=str(uuid4()),
+            username=request.username,
+            role=request.role.value,
+            token_hash=hash_token(token),
+            active=True,
+            created_at=_utcnow(),
+        )
+        with self._session_factory() as session:
+            session.add(record)
+            session.commit()
+        return UserWithToken(
+            id=record.id,
+            username=record.username,
+            role=UserRole(record.role),
+            active=record.active,
+            created_at=record.created_at,
+            token=token,
+        )
+
+    def list_users(self) -> list[UserDefinition]:
+        with self._session_factory() as session:
+            records = session.scalars(
+                select(WorkflowUserRecord).order_by(WorkflowUserRecord.username)
+            ).all()
+            return [self._to_user_domain(record) for record in records]
+
+    def get_user(self, user_id: str) -> UserDefinition | None:
+        with self._session_factory() as session:
+            record = session.get(WorkflowUserRecord, user_id)
+            return None if record is None else self._to_user_domain(record)
+
+    def get_user_by_token(self, token: str) -> UserDefinition | None:
+        with self._session_factory() as session:
+            record = session.scalar(
+                select(WorkflowUserRecord).where(WorkflowUserRecord.token_hash == hash_token(token))
+            )
+            if record is None or not record.active:
+                return None
+            return self._to_user_domain(record)
+
+    def ensure_bootstrap_user(self, username: str, token: str, role: UserRole) -> UserDefinition:
+        with self._session_factory() as session:
+            record = session.scalar(
+                select(WorkflowUserRecord).where(WorkflowUserRecord.username == username)
+            )
+            if record is None:
+                record = WorkflowUserRecord(
+                    id=str(uuid4()),
+                    username=username,
+                    role=role.value,
+                    token_hash=hash_token(token),
+                    active=True,
+                    created_at=_utcnow(),
+                )
+                session.add(record)
+                session.commit()
+            return self._to_user_domain(record)
 
     def _update_step(
         self,
@@ -610,8 +914,10 @@ class SqlAlchemyWorkflowRepository:
             if step is None:
                 return None
             step.status = status.value
-            step.output_payload = output_payload
-            step.error_message = error_message
+            if output_payload is not None:
+                step.output_payload = output_payload
+            if error_message is not None:
+                step.error_message = error_message
             if started:
                 step.started_at = _utcnow()
             if finished:
@@ -634,6 +940,8 @@ class SqlAlchemyWorkflowRepository:
             record.result_payload = result_payload
             record.error_message = error_message
             record.finished_at = _utcnow()
+            record.locked_by = None
+            record.lease_expires_at = None
             session.commit()
             return self._to_run_domain(record)
 
@@ -644,6 +952,7 @@ class SqlAlchemyWorkflowRepository:
             description=record.description,
             version=record.version,
             state=WorkflowState(record.state),
+            settings=WorkflowSettings.model_validate(record.settings or {}),
             nodes=[
                 WorkflowNode(
                     id=node.node_key,
@@ -653,7 +962,16 @@ class SqlAlchemyWorkflowRepository:
                 )
                 for node in record.nodes
             ],
-            edges=[WorkflowEdge(source=edge.source, target=edge.target) for edge in record.edges],
+            edges=[
+                WorkflowEdge(
+                    source=edge.source,
+                    target=edge.target,
+                    condition_value=edge.condition_value,
+                    is_default=edge.is_default,
+                    label=edge.label,
+                )
+                for edge in record.edges
+            ],
         )
 
     def _to_run_domain(self, record: WorkflowRunRecord) -> WorkflowRun:
@@ -668,6 +986,12 @@ class SqlAlchemyWorkflowRepository:
             created_at=record.created_at,
             started_at=record.started_at,
             finished_at=record.finished_at,
+            idempotency_key=record.idempotency_key,
+            timeout_seconds=record.timeout_seconds,
+            retry_of_run_id=record.retry_of_run_id,
+            resume_from_step_index=record.resume_from_step_index,
+            locked_by=record.locked_by,
+            lease_expires_at=record.lease_expires_at,
             steps=[
                 WorkflowRunStep(
                     index=step.step_index,
@@ -692,6 +1016,7 @@ class SqlAlchemyWorkflowRepository:
             provider_key=record.provider_key,
             description=record.description,
             created_at=record.created_at,
+            created_by=record.created_by,
         )
 
     def _to_credential_secret(self, record: WorkflowCredentialRecord) -> CredentialSecret:
@@ -702,7 +1027,8 @@ class SqlAlchemyWorkflowRepository:
             provider_key=record.provider_key,
             description=record.description,
             created_at=record.created_at,
-            secret_payload=record.secret_payload,
+            created_by=record.created_by,
+            secret_payload=decrypt_secret_payload(record.secret_ciphertext),
         )
 
     def _to_run_event_domain(self, record: WorkflowRunEventRecord) -> WorkflowRunEvent:
@@ -718,6 +1044,15 @@ class SqlAlchemyWorkflowRepository:
             provider_key=record.provider_key,
             step_index=record.step_index,
             payload=record.payload,
+        )
+
+    def _to_user_domain(self, record: WorkflowUserRecord) -> UserDefinition:
+        return UserDefinition(
+            id=record.id,
+            username=record.username,
+            role=UserRole(record.role),
+            active=record.active,
+            created_at=record.created_at,
         )
 
     def _get_run_record(self, session: Session, run_id: str) -> WorkflowRunRecord | None:
@@ -740,3 +1075,20 @@ class SqlAlchemyWorkflowRepository:
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+def _event_ordering():
+    return case(
+        (WorkflowRunEventRecord.event_type == "run.queued", 1),
+        (WorkflowRunEventRecord.event_type == "run.started", 2),
+        (WorkflowRunEventRecord.event_type == "step.started", 3),
+        (WorkflowRunEventRecord.event_type == "step.succeeded", 4),
+        (WorkflowRunEventRecord.event_type == "step.failed", 5),
+        (WorkflowRunEventRecord.event_type == "run.paused", 6),
+        (WorkflowRunEventRecord.event_type == "run.resumed", 7),
+        (WorkflowRunEventRecord.event_type == "run.cancel_requested", 8),
+        (WorkflowRunEventRecord.event_type == "run.cancelled", 9),
+        (WorkflowRunEventRecord.event_type == "run.failed", 10),
+        (WorkflowRunEventRecord.event_type == "run.succeeded", 11),
+        else_=50,
+    )

@@ -34,6 +34,18 @@
 
           <section class="stack-section">
             <div class="section-title-row">
+              <h3>Auth</h3>
+              <span class="muted-label">Bearer token</span>
+            </div>
+            <label class="field">
+              <span>Token</span>
+              <input id="auth-token" type="password" placeholder="Bearer token" />
+            </label>
+            <button id="save-auth-button" class="button button-primary">Use Token</button>
+          </section>
+
+          <section class="stack-section">
+            <div class="section-title-row">
               <h3>Workflows</h3>
               <button id="refresh-workflows-button" class="button button-ghost">Refresh</button>
             </div>
@@ -146,6 +158,19 @@
               <button id="run-button" class="button button-primary">Run Selected</button>
             </div>
           </div>
+
+          <section class="stack-section">
+            <div class="section-title-row">
+              <h3>Run Controls</h3>
+              <span class="muted-label">Operator actions</span>
+            </div>
+            <div class="toolbar">
+              <button id="pause-run-button" class="button button-secondary">Pause</button>
+              <button id="resume-run-button" class="button button-secondary">Resume</button>
+              <button id="cancel-run-button" class="button button-secondary">Cancel</button>
+              <button id="retry-run-button" class="button button-secondary">Retry Failed</button>
+            </div>
+          </section>
 
           <section class="stack-section">
             <div class="section-title-row">

@@ -5,6 +5,7 @@ description = "AI Workflow Automation Platform backend foundation"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "cryptography>=45.0.0",
     "fastapi>=0.116.0",
     "pydantic>=2.11.0",
     "sqlalchemy>=2.0.40",

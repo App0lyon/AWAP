@@ -1,4 +1,4 @@
-"""Database engine and session setup."""
+"""Database engine and migration setup."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import os
 
 from sqlalchemy import Engine, create_engine
 
-from awap.repository import Base
+from awap.migrations import apply_migrations
 
 DEFAULT_DATABASE_URL = "sqlite:///./awap.db"
 
@@ -20,8 +20,13 @@ def get_database_url(explicit_url: str | None = None) -> str:
 def create_database_engine(database_url: str | None = None) -> Engine:
     resolved_url = get_database_url(database_url)
     connect_args = {"check_same_thread": False} if resolved_url.startswith("sqlite") else {}
-    return create_engine(resolved_url, future=True, connect_args=connect_args)
+    return create_engine(
+        resolved_url,
+        future=True,
+        connect_args=connect_args,
+        pool_pre_ping=True,
+    )
 
 
 def initialize_database(engine: Engine) -> None:
-    Base.metadata.create_all(engine)
+    apply_migrations(engine)

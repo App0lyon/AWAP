@@ -1,4 +1,5 @@
 const state = {
+  authToken: window.localStorage.getItem("awap.authToken") || "awap-dev-admin-token",
   nodeTypes: [],
   providers: [],
   credentials: [],
@@ -40,19 +41,31 @@ const els = {
   credentialDialog: document.querySelector("#credential-dialog"),
   credentialForm: document.querySelector("#credential-form"),
   credentialProvider: document.querySelector("#credential-provider"),
+  authToken: document.querySelector("#auth-token"),
 }
 
 const defaultConfigByType = {
   manual_trigger: {},
   schedule_trigger: { cron: "0 * * * *" },
   llm_prompt: {
-    provider: "echo_llm",
-    model: "demo-model",
+    provider: "nvidia_build_free_chat",
+    model: "meta/llama-3.1-8b-instruct",
     prompt_template: "Summarize {{input.text}}",
+    mock_response: "Mocked NVIDIA response",
   },
   decision: {
     condition_key: "last.matched",
     equals: true,
+  },
+  join: {},
+  sub_workflow: {
+    workflow_id: "",
+    input_mapping: { text: "input.text" },
+  },
+  for_each: {
+    workflow_id: "",
+    items_path: "input.items",
+    item_key: "item",
   },
   http_request: {
     provider: "http_tool",
@@ -70,6 +83,7 @@ const defaultConfigByType = {
 boot().catch(handleError)
 
 async function boot() {
+  els.authToken.value = state.authToken
   bindEvents()
   await refreshLibrary()
   renderAll()
@@ -97,6 +111,11 @@ function bindEvents() {
   document.querySelector("#run-button").addEventListener("click", startRun)
   document.querySelector("#refresh-runs-button").addEventListener("click", refreshRuns)
   document.querySelector("#add-credential-button").addEventListener("click", openCredentialDialog)
+  document.querySelector("#save-auth-button").addEventListener("click", saveAuthToken)
+  document.querySelector("#pause-run-button").addEventListener("click", pauseSelectedRun)
+  document.querySelector("#resume-run-button").addEventListener("click", resumeSelectedRun)
+  document.querySelector("#cancel-run-button").addEventListener("click", cancelSelectedRun)
+  document.querySelector("#retry-run-button").addEventListener("click", retrySelectedRun)
 
   els.workflowList.addEventListener("click", onWorkflowListClick)
   els.versionList.addEventListener("click", onVersionListClick)
@@ -211,6 +230,12 @@ function stopRunPolling() {
   }
 }
 
+function saveAuthToken() {
+  state.authToken = els.authToken.value.trim() || "awap-dev-admin-token"
+  window.localStorage.setItem("awap.authToken", state.authToken)
+  refreshEverything().catch(handleError)
+}
+
 async function saveNewWorkflow() {
   const payload = collectEditorPayload()
   const created = await api("/workflows", {
@@ -282,6 +307,47 @@ async function startRun() {
   state.runEvents = []
   renderRuns()
   renderRunEvents()
+  startRunPolling(run.id)
+}
+
+async function pauseSelectedRun() {
+  if (!state.selectedRunId) {
+    throw new Error("Select a run first.")
+  }
+  const run = await api(`/runs/${state.selectedRunId}/pause`, { method: "POST" })
+  upsertRun(run)
+  renderRuns()
+}
+
+async function resumeSelectedRun() {
+  if (!state.selectedRunId) {
+    throw new Error("Select a run first.")
+  }
+  const run = await api(`/runs/${state.selectedRunId}/resume`, { method: "POST" })
+  upsertRun(run)
+  renderRuns()
+  if (run.status === "queued" || run.status === "running") {
+    startRunPolling(run.id)
+  }
+}
+
+async function cancelSelectedRun() {
+  if (!state.selectedRunId) {
+    throw new Error("Select a run first.")
+  }
+  const run = await api(`/runs/${state.selectedRunId}/cancel`, { method: "POST" })
+  upsertRun(run)
+  renderRuns()
+}
+
+async function retrySelectedRun() {
+  if (!state.selectedRunId) {
+    throw new Error("Select a run first.")
+  }
+  const run = await api(`/runs/${state.selectedRunId}/retry?from_failed_step=true`, { method: "POST" })
+  upsertRun(run)
+  state.selectedRunId = run.id
+  renderRuns()
   startRunPolling(run.id)
 }
 
@@ -478,6 +544,9 @@ function collectEditorPayload() {
   const edges = Array.from(els.edgeEditorList.querySelectorAll(".edge-card")).map((card) => ({
     source: card.querySelector(".edge-source-select").value,
     target: card.querySelector(".edge-target-select").value,
+    condition_value: normalizeEdgeCondition(card.querySelector(".edge-condition-input").value),
+    is_default: card.querySelector(".edge-default-input").checked,
+    label: card.querySelector(".edge-label-input").value.trim(),
   }))
 
   return {
@@ -485,6 +554,7 @@ function collectEditorPayload() {
     description: els.workflowDescription.value.trim(),
     nodes,
     edges,
+    settings: state.draft.settings || { max_concurrent_runs: 3 },
   }
 }
 
@@ -721,6 +791,18 @@ function renderEdgeCard(edge, index) {
             ${injectSelectedOption(nodeOptions, edge.target)}
           </select>
         </label>
+        <label class="field">
+          <span>Route Match</span>
+          <input class="edge-condition-input" value="${escapeHtml(edge.condition_value ?? "")}" />
+        </label>
+        <label class="field">
+          <span>Label</span>
+          <input class="edge-label-input" value="${escapeHtml(edge.label || "")}" />
+        </label>
+        <label class="field">
+          <span>Default</span>
+          <input class="edge-default-input" type="checkbox" ${edge.is_default ? "checked" : ""} />
+        </label>
       </div>
     </article>
   `
@@ -877,6 +959,7 @@ function createBlankWorkflow() {
   return {
     name: "",
     description: "",
+    settings: { max_concurrent_runs: 3 },
     nodes: [
       {
         id: "manual_trigger_1",
@@ -895,6 +978,7 @@ function workflowToDraft(workflow) {
     description: workflow.description,
     nodes: workflow.nodes,
     edges: workflow.edges,
+    settings: workflow.settings || { max_concurrent_runs: 3 },
   }
 }
 
@@ -936,6 +1020,7 @@ async function api(path, options = {}) {
   const response = await fetch(path, {
     headers: {
       "Content-Type": "application/json",
+      Authorization: `Bearer ${state.authToken}`,
       ...(options.headers || {}),
     },
     ...options,
@@ -969,6 +1054,23 @@ function parseJson(rawValue, errorMessage) {
 
 function jsonPretty(value) {
   return JSON.stringify(value, null, 2)
+}
+
+function normalizeEdgeCondition(value) {
+  if (!value) {
+    return null
+  }
+  const trimmed = value.trim()
+  if (trimmed === "true") {
+    return true
+  }
+  if (trimmed === "false") {
+    return false
+  }
+  if (!Number.isNaN(Number(trimmed)) && trimmed !== "") {
+    return Number(trimmed)
+  }
+  return trimmed
 }
 
 function omit(object, keys) {
