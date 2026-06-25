@@ -3,6 +3,10 @@ const state = {
   nodeTypes: [],
   providers: [],
   credentials: [],
+  environments: [],
+  environmentReleases: [],
+  selectedEnvironment: "",
+  runStatusFilter: "",
   templates: [],
   workflows: [],
   versions: [],
@@ -15,11 +19,13 @@ const state = {
   runs: [],
   selectedRunId: null,
   runEvents: [],
+  approvalTasks: [],
   comments: [],
   auditLogs: [],
   operationsSummary: null,
   sourceControl: null,
   runPollTimer: null,
+  runEventStreamController: null,
 }
 
 const els = {
@@ -30,6 +36,10 @@ const els = {
   versionCaption: document.querySelector("#version-caption"),
   nodeTypeList: document.querySelector("#node-type-list"),
   providerList: document.querySelector("#provider-list"),
+  environmentList: document.querySelector("#environment-list"),
+  runEnvironmentSelect: document.querySelector("#run-environment-select"),
+  runStatusFilter: document.querySelector("#run-status-filter"),
+  environmentReleaseList: document.querySelector("#environment-release-list"),
   credentialList: document.querySelector("#credential-list"),
   editorCaption: document.querySelector("#editor-caption"),
   workflowName: document.querySelector("#workflow-name"),
@@ -47,6 +57,8 @@ const els = {
   runList: document.querySelector("#run-list"),
   runEventCaption: document.querySelector("#run-event-caption"),
   runEventList: document.querySelector("#run-event-list"),
+  approvalComment: document.querySelector("#approval-comment"),
+  approvalTaskList: document.querySelector("#approval-task-list"),
   commentInput: document.querySelector("#comment-input"),
   commentList: document.querySelector("#comment-list"),
   operationsSummaryOutput: document.querySelector("#operations-summary-output"),
@@ -163,18 +175,25 @@ function bindEvents() {
   document.querySelector("#resume-run-button").addEventListener("click", resumeSelectedRun)
   document.querySelector("#cancel-run-button").addEventListener("click", cancelSelectedRun)
   document.querySelector("#retry-run-button").addEventListener("click", retrySelectedRun)
+  document.querySelector("#search-runs-button").addEventListener("click", refreshRuns)
+  document.querySelector("#promote-version-button").addEventListener("click", promoteSelectedVersion)
+  document.querySelector("#refresh-approvals-button").addEventListener("click", refreshApprovals)
   document.querySelector("#compare-version-button").addEventListener("click", compareSelectedVersion)
   document.querySelector("#save-comment-button").addEventListener("click", saveComment)
 
   els.workflowList.addEventListener("click", onWorkflowListClick)
   els.workflowTemplateList.addEventListener("click", onTemplateListClick)
   els.versionList.addEventListener("click", onVersionListClick)
+  els.environmentList.addEventListener("click", onEnvironmentListClick)
+  els.runEnvironmentSelect.addEventListener("change", onRunEnvironmentChange)
+  els.runStatusFilter.addEventListener("change", onRunStatusFilterChange)
   els.nodeTypeList.addEventListener("click", onNodePaletteClick)
   els.nodeEditorList.addEventListener("click", onNodeEditorClick)
   els.nodeEditorList.addEventListener("change", onNodeEditorChange)
   els.edgeEditorList.addEventListener("click", onEdgeEditorClick)
   els.edgeEditorList.addEventListener("change", onEdgeEditorChange)
   els.runList.addEventListener("click", onRunListClick)
+  els.approvalTaskList.addEventListener("click", onApprovalTaskClick)
 
   els.workflowName.addEventListener("change", syncDraftSafely)
   els.workflowDescription.addEventListener("change", syncDraftSafely)
@@ -194,32 +213,43 @@ async function refreshEverything() {
 
 async function refreshLibrary() {
   setStatus("Loading")
-  const [nodeTypes, providers, credentials, workflows, templates] = await Promise.all([
+  const [nodeTypes, providers, credentials, workflows, templates, environments] = await Promise.all([
     api("/node-types"),
     api("/providers"),
     api("/credentials"),
     api("/workflows"),
     api("/workflow-templates"),
+    api("/environments"),
   ])
   state.nodeTypes = nodeTypes
   state.providers = providers
   state.credentials = credentials
   state.workflows = workflows
   state.templates = templates
+  state.environments = environments
+  if (
+    state.selectedEnvironment &&
+    !state.environments.some((environment) => environment.name === state.selectedEnvironment)
+  ) {
+    state.selectedEnvironment = ""
+  }
   populateCredentialProviderOptions()
+  populateRunEnvironmentOptions()
   renderLibrary()
   setStatus("Ready")
 }
 
 async function refreshOperations() {
-  const [summary, sourceControl, auditLogs] = await Promise.allSettled([
+  const [summary, sourceControl, auditLogs, approvals] = await Promise.allSettled([
     api("/observability/summary"),
     api("/source-control/status"),
     api("/audit-logs?limit=25"),
+    api("/approval-tasks?decision=pending"),
   ])
   state.operationsSummary = summary.status === "fulfilled" ? summary.value : null
   state.sourceControl = sourceControl.status === "fulfilled" ? sourceControl.value : null
   state.auditLogs = auditLogs.status === "fulfilled" ? auditLogs.value : []
+  state.approvalTasks = approvals.status === "fulfilled" ? approvals.value : []
 }
 
 async function refreshWorkflows() {
@@ -236,6 +266,8 @@ async function loadWorkflow(workflowId, version = null) {
   state.draft = workflowToDraft(workflow)
   state.versions = await api(`/workflows/${workflowId}/versions`)
   state.comments = await api(`/workflows/${workflowId}/comments?workflow_version=${workflow.version}`)
+  await refreshEnvironmentReleases(workflowId)
+  await refreshApprovals()
   state.versionDiff =
     workflow.version > 1
       ? await api(`/workflows/${workflowId}/versions/compare?from_version=${workflow.version - 1}&to_version=${workflow.version}`)
@@ -256,8 +288,40 @@ async function refreshRuns() {
     renderRuns()
     return
   }
-  state.runs = await api(`/workflows/${state.selectedWorkflowId}/runs`)
+  state.runStatusFilter = els.runStatusFilter.value
+  const params = new URLSearchParams({
+    workflow_id: state.selectedWorkflowId,
+    limit: "50",
+  })
+  if (state.selectedEnvironment) {
+    params.set("environment", state.selectedEnvironment)
+  }
+  if (state.runStatusFilter) {
+    params.set("status", state.runStatusFilter)
+  }
+  state.runs = await api(`/runs/search?${params.toString()}`)
   renderRuns()
+}
+
+async function refreshEnvironmentReleases(workflowId = state.selectedWorkflowId) {
+  if (!workflowId || state.environments.length === 0) {
+    state.environmentReleases = []
+    renderEnvironmentReleases()
+    return
+  }
+  const releaseGroups = await Promise.all(
+    state.environments.map((environment) => api(`/environments/${environment.name}/releases`))
+  )
+  state.environmentReleases = releaseGroups
+    .flat()
+    .filter((release) => release.workflow_id === workflowId)
+    .sort((left, right) => left.environment.localeCompare(right.environment))
+  renderEnvironmentReleases()
+}
+
+async function refreshApprovals() {
+  state.approvalTasks = await api("/approval-tasks?decision=pending")
+  renderApprovals()
 }
 
 async function selectRun(runId) {
@@ -276,27 +340,69 @@ async function selectRun(runId) {
 
 function startRunPolling(runId) {
   stopRunPolling()
-  state.runPollTimer = window.setInterval(async () => {
-    try {
-      const run = await api(`/runs/${runId}`)
-      upsertRun(run)
-      state.runEvents = await api(`/runs/${runId}/events`)
-      renderRuns()
-      renderRunEvents()
-      if (run.status !== "queued" && run.status !== "running") {
-        stopRunPolling()
-      }
-    } catch (error) {
-      stopRunPolling()
+  state.runEventStreamController = new AbortController()
+  streamRunEvents(runId, state.runEventStreamController).catch((error) => {
+    if (error.name !== "AbortError") {
       handleError(error)
     }
-  }, 1500)
+  })
 }
 
 function stopRunPolling() {
   if (state.runPollTimer) {
     window.clearInterval(state.runPollTimer)
     state.runPollTimer = null
+  }
+  if (state.runEventStreamController) {
+    state.runEventStreamController.abort()
+    state.runEventStreamController = null
+  }
+}
+
+async function streamRunEvents(runId, controller) {
+  const response = await fetch(`/runs/${runId}/events/stream`, {
+    headers: { Authorization: `Bearer ${state.authToken}` },
+    signal: controller.signal,
+  })
+  if (!response.ok) {
+    throw new Error(`${response.status} ${response.statusText}`)
+  }
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ""
+  try {
+    while (true) {
+      const { value, done } = await reader.read()
+      if (done) {
+        break
+      }
+      buffer += decoder.decode(value, { stream: true })
+      const messages = buffer.split("\n\n")
+      buffer = messages.pop() || ""
+      for (const message of messages) {
+        const line = message.split("\n").find((item) => item.startsWith("data: "))
+        if (!line) {
+          continue
+        }
+        const event = JSON.parse(line.slice(6))
+        upsertRunEvent(event)
+        renderRunEvents()
+        if (event.event_type.startsWith("run.")) {
+          const run = await api(`/runs/${runId}`)
+          upsertRun(run)
+          renderRuns()
+        }
+      }
+    }
+  } finally {
+    if (!controller.signal.aborted) {
+      const run = await api(`/runs/${runId}`)
+      upsertRun(run)
+      renderRuns()
+      if (state.runEventStreamController === controller) {
+        state.runEventStreamController = null
+      }
+    }
   }
 }
 
@@ -365,11 +471,15 @@ async function planSelected() {
 async function startRun() {
   requireSelection()
   const inputPayload = parseJson(els.runInput.value || "{}", "Run input JSON is invalid.")
+  const requestBody = { input_payload: inputPayload }
+  if (state.selectedEnvironment) {
+    requestBody.environment = state.selectedEnvironment
+  }
   const run = await api(
     `/workflows/${state.selectedWorkflowId}/runs?version=${state.selectedVersion}`,
     {
       method: "POST",
-      body: JSON.stringify({ input_payload: inputPayload }),
+      body: JSON.stringify(requestBody),
     }
   )
   upsertRun(run)
@@ -378,6 +488,42 @@ async function startRun() {
   renderRuns()
   renderRunEvents()
   startRunPolling(run.id)
+}
+
+async function promoteSelectedVersion() {
+  requireSelection()
+  if (!state.selectedEnvironment) {
+    throw new Error("Choose an environment before promoting.")
+  }
+  await api(`/workflows/${state.selectedWorkflowId}/promotions`, {
+    method: "POST",
+    body: JSON.stringify({
+      environment: state.selectedEnvironment,
+      version: state.selectedVersion,
+    }),
+  })
+  await refreshEnvironmentReleases()
+  state.auditLogs = await api("/audit-logs?limit=25")
+  renderAdminView()
+  setStatus("Version Promoted")
+}
+
+async function decideApprovalTask(approvalTaskId, decision) {
+  const comment = els.approvalComment.value.trim()
+  await api(`/approval-tasks/${approvalTaskId}/decision`, {
+    method: "POST",
+    body: JSON.stringify({
+      decision,
+      comment,
+      payload: {},
+    }),
+  })
+  els.approvalComment.value = ""
+  await refreshApprovals()
+  if (state.selectedRunId) {
+    await selectRun(state.selectedRunId)
+  }
+  setStatus(decision === "approved" ? "Approval Sent" : "Rejection Sent")
 }
 
 async function pauseSelectedRun() {
@@ -516,6 +662,27 @@ function onTemplateListClick(event) {
   setStatus(`Loaded ${template.display_name}`)
 }
 
+function onEnvironmentListClick(event) {
+  const button = event.target.closest("[data-environment-name]")
+  if (!button) {
+    return
+  }
+  state.selectedEnvironment = button.dataset.environmentName
+  populateRunEnvironmentOptions()
+  renderEnvironments()
+  refreshRuns().catch(handleError)
+}
+
+function onRunEnvironmentChange() {
+  state.selectedEnvironment = els.runEnvironmentSelect.value
+  renderEnvironments()
+  renderEnvironmentReleases()
+}
+
+function onRunStatusFilterChange() {
+  state.runStatusFilter = els.runStatusFilter.value
+}
+
 function onNodePaletteClick(event) {
   const button = event.target.closest("[data-add-node-type]")
   if (!button) {
@@ -592,6 +759,14 @@ function onRunListClick(event) {
     return
   }
   selectRun(button.dataset.runId).catch(handleError)
+}
+
+function onApprovalTaskClick(event) {
+  const button = event.target.closest("[data-approval-task-id]")
+  if (!button) {
+    return
+  }
+  decideApprovalTask(button.dataset.approvalTaskId, button.dataset.approvalDecision).catch(handleError)
 }
 
 function onAddNode() {
@@ -686,8 +861,10 @@ function renderAll() {
   renderValidation()
   renderPlan()
   renderVersionDiff()
+  renderEnvironmentReleases()
   renderRuns()
   renderRunEvents()
+  renderApprovals()
   renderComments()
   renderAdminView()
 }
@@ -698,6 +875,7 @@ function renderLibrary() {
   renderVersionList()
   renderNodeTypes()
   renderProviders()
+  renderEnvironments()
   renderCredentials()
 }
 
@@ -785,6 +963,37 @@ function renderProviders() {
       `
     )
     .join("")
+}
+
+function renderEnvironments() {
+  els.environmentList.innerHTML = [
+    `
+      <button
+        class="environment-item ${state.selectedEnvironment === "" ? "is-selected" : ""}"
+        data-environment-name=""
+      >
+        <div class="item-headline">
+          <strong class="item-title">Unscoped</strong>
+          <span class="pill">direct</span>
+        </div>
+        <div class="item-meta">Run the selected version without environment variables.</div>
+      </button>
+    `,
+    ...state.environments.map(
+      (environment) => `
+        <button
+          class="environment-item ${environment.name === state.selectedEnvironment ? "is-selected" : ""}"
+          data-environment-name="${escapeHtml(environment.name)}"
+        >
+          <div class="item-headline">
+            <strong class="item-title">${escapeHtml(environment.name)}</strong>
+            <span class="pill">${environment.is_default ? "default" : "env"}</span>
+          </div>
+          <div class="item-meta">${escapeHtml(environment.description || "No description")}</div>
+        </button>
+      `
+    ),
+  ].join("")
 }
 
 function renderCredentials() {
@@ -1103,6 +1312,24 @@ function renderVersionDiff() {
   els.versionDiffOutput.textContent = jsonPretty(state.versionDiff)
 }
 
+function renderEnvironmentReleases() {
+  els.environmentReleaseList.innerHTML = state.environmentReleases
+    .map((release) => {
+      const isSelectedEnvironment = release.environment === state.selectedEnvironment
+      return `
+        <div class="environment-release-item ${isSelectedEnvironment ? "is-selected" : ""}">
+          <div class="item-headline">
+            <strong class="item-title">${escapeHtml(release.environment)}</strong>
+            <span class="pill">v${release.workflow_version}</span>
+          </div>
+          <div class="item-meta">${escapeHtml(release.promoted_at)}</div>
+          <div class="item-meta">${escapeHtml(release.promoted_by || "system")}</div>
+        </div>
+      `
+    })
+    .join("")
+}
+
 function renderRuns() {
   els.runList.innerHTML = state.runs
     .map(
@@ -1113,8 +1340,42 @@ function renderRuns() {
             <span class="pill">${escapeHtml(run.status)}</span>
           </div>
           <div class="item-meta">Version ${run.workflow_version}</div>
+          <div class="item-meta">Environment ${escapeHtml(run.environment || "unscoped")}</div>
           <div class="item-meta">${escapeHtml(run.created_at)}</div>
         </button>
+      `
+    )
+    .join("")
+}
+
+function renderApprovals() {
+  els.approvalTaskList.innerHTML = state.approvalTasks
+    .map(
+      (task) => `
+        <div class="approval-task-item">
+          <div class="item-headline">
+            <strong class="item-title">${escapeHtml(task.title)}</strong>
+            <span class="pill">${escapeHtml(task.decision)}</span>
+          </div>
+          <div class="item-meta">Run ${escapeHtml(task.run_id.slice(0, 8))} · step ${task.step_index}</div>
+          <div class="item-meta">${escapeHtml(task.prompt)}</div>
+          <div class="toolbar tiny-row">
+            <button
+              class="button button-primary"
+              data-approval-task-id="${escapeHtml(task.id)}"
+              data-approval-decision="approved"
+            >
+              Approve
+            </button>
+            <button
+              class="button button-secondary"
+              data-approval-task-id="${escapeHtml(task.id)}"
+              data-approval-decision="rejected"
+            >
+              Reject
+            </button>
+          </div>
+        </div>
       `
     )
     .join("")
@@ -1193,6 +1454,25 @@ function populateCredentialProviderOptions() {
       )
       .join("")}
   `
+}
+
+function populateRunEnvironmentOptions() {
+  els.runEnvironmentSelect.innerHTML = `
+    <option value="">Unscoped</option>
+    ${state.environments
+      .map(
+        (environment) => `
+          <option
+            value="${escapeHtml(environment.name)}"
+            ${environment.name === state.selectedEnvironment ? "selected" : ""}
+          >
+            ${escapeHtml(environment.name)}${environment.is_default ? " (default)" : ""}
+          </option>
+        `
+      )
+      .join("")}
+  `
+  els.runEnvironmentSelect.value = state.selectedEnvironment
 }
 
 function getProvidersForNodeType(nodeType) {
@@ -1289,6 +1569,13 @@ function upsertRun(run) {
   } else {
     state.runs[index] = run
   }
+}
+
+function upsertRunEvent(event) {
+  if (state.runEvents.some((item) => item.id === event.id)) {
+    return
+  }
+  state.runEvents.push(event)
 }
 
 function requireSelection() {

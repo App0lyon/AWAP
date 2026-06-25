@@ -1,18 +1,18 @@
 :root {
-  --bg: #f5efe2;
-  --bg-deep: #e8dcc2;
+  --bg: #f6f7f4;
+  --bg-deep: #e4e8e2;
   --ink: #1f1b16;
   --muted: #6e6258;
   --line: rgba(33, 24, 16, 0.12);
-  --panel: rgba(255, 251, 244, 0.84);
-  --panel-strong: rgba(255, 247, 234, 0.96);
-  --accent: #ba4a2f;
-  --accent-strong: #90341e;
-  --accent-soft: rgba(186, 74, 47, 0.12);
-  --teal: #1f6b68;
-  --gold: #c58c24;
-  --shadow: 0 18px 50px rgba(59, 38, 18, 0.14);
-  --radius: 22px;
+  --panel: rgba(255, 255, 255, 0.88);
+  --panel-strong: rgba(255, 255, 255, 0.98);
+  --accent: #315f72;
+  --accent-strong: #22495a;
+  --accent-soft: rgba(49, 95, 114, 0.12);
+  --teal: #2f695f;
+  --gold: #9a7a27;
+  --shadow: 0 14px 34px rgba(35, 43, 38, 0.11);
+  --radius: 8px;
 }
 
 * {
@@ -20,11 +20,10 @@
 }
 
 html {
-  background:
-    radial-gradient(circle at top left, rgba(197, 140, 36, 0.18), transparent 30%),
-    linear-gradient(180deg, #fbf6eb 0%, var(--bg) 45%, #efe3c9 100%);
+  background: linear-gradient(180deg, #fbfcfa 0%, var(--bg) 100%);
   color: var(--ink);
-  font-family: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", "URW Palladio L", serif;
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 
 body {
@@ -46,30 +45,6 @@ select {
   padding: 28px;
 }
 
-.background-orb {
-  position: absolute;
-  border-radius: 999px;
-  filter: blur(14px);
-  opacity: 0.42;
-  pointer-events: none;
-}
-
-.orb-one {
-  top: -120px;
-  right: -80px;
-  width: 320px;
-  height: 320px;
-  background: radial-gradient(circle, rgba(31, 107, 104, 0.42), transparent 70%);
-}
-
-.orb-two {
-  bottom: -100px;
-  left: -80px;
-  width: 300px;
-  height: 300px;
-  background: radial-gradient(circle, rgba(186, 74, 47, 0.28), transparent 70%);
-}
-
 .hero,
 .panel {
   position: relative;
@@ -83,9 +58,9 @@ select {
   gap: 24px;
   padding: 24px 28px;
   margin-bottom: 22px;
-  background: linear-gradient(135deg, rgba(255, 248, 236, 0.94), rgba(243, 230, 204, 0.84));
+  background: var(--panel);
   border: 1px solid rgba(31, 27, 22, 0.08);
-  border-radius: 28px;
+  border-radius: var(--radius);
   box-shadow: var(--shadow);
   animation: lift-in 420ms ease;
 }
@@ -198,6 +173,9 @@ select {
 .workflow-item,
 .version-item,
 .run-item,
+.environment-item,
+.environment-release-item,
+.approval-task-item,
 .credential-item,
 .provider-item,
 .plan-item,
@@ -208,7 +186,7 @@ select {
   padding: 14px;
   background: rgba(255, 255, 255, 0.66);
   border: 1px solid var(--line);
-  border-radius: 18px;
+  border-radius: var(--radius);
   transition:
     transform 140ms ease,
     border-color 140ms ease,
@@ -218,6 +196,7 @@ select {
 .workflow-item:hover,
 .version-item:hover,
 .run-item:hover,
+.environment-item:hover,
 .node-card:hover,
 .edge-card:hover,
 .canvas-card:hover {
@@ -285,7 +264,7 @@ select {
 
 .button {
   border: 0;
-  border-radius: 999px;
+  border-radius: var(--radius);
   padding: 10px 15px;
   cursor: pointer;
   transition:
@@ -378,7 +357,7 @@ select {
 .field select {
   width: 100%;
   padding: 10px 12px;
-  border-radius: 14px;
+  border-radius: var(--radius);
   border: 1px solid rgba(31, 27, 22, 0.12);
   background: rgba(255, 255, 255, 0.78);
   color: var(--ink);
@@ -394,8 +373,15 @@ select {
   min-width: 0;
   background: rgba(255, 252, 247, 0.62);
   border: 1px solid rgba(31, 27, 22, 0.06);
-  border-radius: 20px;
+  border-radius: var(--radius);
   padding: 16px;
+}
+
+.control-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 12px;
 }
 
 .node-card-grid,

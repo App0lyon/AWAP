@@ -13,6 +13,7 @@ from typing import Any
 from cryptography.fernet import Fernet
 
 DEFAULT_SECRET_SEED = "awap-local-dev-secret"
+PRODUCTION_MODE = "production"
 
 
 def generate_bearer_token() -> str:
@@ -35,7 +36,11 @@ def decrypt_secret_payload(ciphertext: str) -> dict[str, Any]:
 
 @lru_cache(maxsize=1)
 def _get_fernet() -> Fernet:
-    seed = os.getenv("AWAP_SECRET_KEY", DEFAULT_SECRET_SEED)
+    seed = os.getenv("AWAP_SECRET_KEY")
+    if not seed:
+        if os.getenv("AWAP_MODE", "local").lower() == PRODUCTION_MODE:
+            raise RuntimeError("AWAP_SECRET_KEY is required when AWAP_MODE=production.")
+        seed = DEFAULT_SECRET_SEED
     digest = hashlib.sha256(seed.encode("utf-8")).digest()
     key = base64.urlsafe_b64encode(digest)
     return Fernet(key)

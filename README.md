@@ -15,7 +15,13 @@ It currently provides:
 - execution planning and validation
 - background workflow execution with durable run tracking
 - provider abstractions for LLMs, tools, credentials, and observability
+- bearer-token authentication and role-based access
+- environment promotion with readiness checks and policy enforcement
+- encrypted, scope-aware credentials
+- lightweight schema migrations
 - SQLite-backed persistence
+- Postgres-compatible SQLAlchemy persistence for production deployments
+- a queue abstraction with a SQLite lease-table adapter for local development
 
 The frontend and backend are served together. There is no separate frontend build step right now.
 
@@ -49,6 +55,10 @@ The frontend and backend are served together. There is no separate frontend buil
 - track run state: `queued`, `running`, `succeeded`, `failed`
 - track step state per node
 - inspect run events for observability
+- stream run events with Server-Sent Events
+- pause, resume, cancel, and retry workflow runs
+- route failed work into dead-letter records
+- inspect monitoring alerts, worker health, and infrastructure status
 
 ### Provider Model
 
@@ -56,13 +66,23 @@ The frontend and backend are served together. There is no separate frontend buil
 - tool execution is abstracted behind tool providers
 - observability sinks are abstracted behind observability providers
 - credentials are stored separately from workflow definitions and resolved at execution time
+- credentials can be scoped to workflows and environments
+- environment policy can restrict HTTP hosts, SQL database paths, and file write roots
+- run-event payloads are redacted before being stored
+
+### Deployment Readiness
+
+- inspect workflow-version readiness before promotion or environment execution
+- check provider registration and credential configuration
+- enforce readiness checks during environment promotion and environment-scoped runs
+- report the active infrastructure model honestly: SQLite-backed run leases with in-process workers
 
 ## Built-In Providers
 
 The current implementation includes built-in providers so the platform is functional without external vendor setup:
 
-- `echo_llm`
-  local placeholder LLM provider used by `llm_prompt`
+- `nvidia_build_free_chat`
+  NVIDIA Build chat-completions provider used by `llm_prompt` and `ai_agent`
 - `http_tool`
   performs real HTTP requests for `http_request`
 - `notification_tool`
@@ -79,6 +99,7 @@ The current implementation includes built-in providers so the platform is functi
 - FastAPI for the HTTP server
 - SQLAlchemy for persistence
 - SQLite as the default database
+- Postgres with `psycopg` for production database deployments
 - pytest for tests
 - Ruff for linting
 - plain HTML/CSS/JavaScript for the frontend editor
@@ -184,6 +205,66 @@ There is no separate Node/Vite/React dev server in the current architecture.
 
 ## Configuration
 
+### Runtime Modes
+
+AWAP has two intended runtime modes.
+
+#### Local single-process AWAP
+
+Local mode is the default:
+
+```bash
+export AWAP_MODE=local
+uv run awap-dev
+```
+
+In this mode:
+
+- the default database is `sqlite:///./awap.db`
+- worker threads run in the FastAPI process
+- `AWAP_WORKER_COUNT` defaults to `2`
+- the queue adapter is the SQLite lease-table adapter
+- the bootstrap admin token defaults to `awap-dev-admin-token`
+- the local encryption seed is allowed for development credentials
+
+This mode is convenient for development, tests, and demos. It is not the target production topology.
+
+#### Production AWAP
+
+Production mode requires explicit secrets and should use a production database:
+
+```bash
+export AWAP_MODE=production
+export AWAP_DATABASE_URL="postgresql://awap:change-me@localhost:5432/awap"
+export AWAP_BOOTSTRAP_ADMIN_TOKEN="replace-with-a-long-random-token"
+export AWAP_SECRET_KEY="replace-with-a-long-random-secret"
+uv run awap-dev
+```
+
+In this mode:
+
+- `AWAP_BOOTSTRAP_ADMIN_TOKEN` is required
+- `AWAP_SECRET_KEY` is required before credentials can be encrypted or decrypted
+- Postgres URLs are normalized to the `psycopg` SQLAlchemy driver
+- knowledge retrieval uses a pgvector sidecar table, `knowledge_vectors`, populated during document ingestion
+- SQL migrations create composite indexes for workflow versions, run search, queued claims, events, approval tasks, environment releases, audit logs, dead letters, comments, and knowledge chunks
+- the queue interface is explicit, so a managed queue adapter can replace the local SQLite lease-table adapter
+- the API process defaults to `AWAP_WORKER_COUNT=0`; run workers separately with `uv run awap-worker`
+
+Example production process split:
+
+```bash
+# API process
+export AWAP_MODE=production
+export AWAP_WORKER_COUNT=0
+uv run awap-dev
+
+# Worker process
+export AWAP_MODE=production
+export AWAP_WORKER_COUNT=4
+uv run awap-worker
+```
+
 ### Database
 
 By default, the application uses:
@@ -199,6 +280,28 @@ $env:AWAP_DATABASE_URL = "sqlite:///./custom-awap.db"
 uv run awap-dev
 ```
 
+For Postgres:
+
+```bash
+export AWAP_DATABASE_URL="postgresql://awap:change-me@localhost:5432/awap"
+uv run awap-dev
+```
+
+Postgres production deployments must have the `vector` extension available. AWAP migrations run:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+```
+
+and create the `knowledge_vectors` retrieval table with an HNSW vector index.
+
+Optional pool settings:
+
+```bash
+export AWAP_DATABASE_POOL_SIZE=10
+export AWAP_DATABASE_MAX_OVERFLOW=20
+```
+
 On Linux/macOS:
 
 ```bash
@@ -208,9 +311,9 @@ uv run awap-dev
 
 ### Notes About Persistence
 
-- the schema is created automatically at startup
-- there is no migration system yet
-- if you make incompatible schema changes later, existing local databases may need manual handling
+- the schema is created and migrated automatically at startup
+- migrations are intentionally lightweight and versioned in `src/awap/migrations.py`
+- incompatible data migrations may still need explicit migration code
 
 ## How The System Works
 
@@ -315,13 +418,33 @@ Important current behavior:
 - `POST /workflows/{workflow_id}/runs`
 - `GET /runs/{run_id}`
 - `GET /runs/{run_id}/events`
+- `GET /runs/{run_id}/events/stream`
+- `GET /runs/search`
+- `POST /runs/{run_id}/pause`
+- `POST /runs/{run_id}/resume`
+- `POST /runs/{run_id}/cancel`
+- `POST /runs/{run_id}/retry`
 
 ### Provider and Credential Routes
 
 - `GET /providers`
+- `GET /providers/{provider_key}/connection`
 - `GET /credentials`
 - `POST /credentials`
 - `GET /credentials/{credential_id}`
+
+### Environment, Readiness, and Operations Routes
+
+- `GET /environments`
+- `POST /environments`
+- `GET /environments/{environment}/releases`
+- `POST /workflows/{workflow_id}/promotions`
+- `GET /workflows/{workflow_id}/versions/{version}/readiness`
+- `GET /observability/summary`
+- `GET /observability/alerts`
+- `GET /worker-health`
+- `GET /dead-letters`
+- `GET /infrastructure/status`
 
 ## Example Development Flow
 
@@ -347,6 +470,13 @@ uv run pytest
 
 ```powershell
 uv run ruff check
+```
+
+### Run CI-equivalent checks
+
+```powershell
+uv run ruff check
+uv run pytest --cov=awap --cov-report=term-missing --cov-fail-under=80
 ```
 
 ## Development Commands
@@ -400,19 +530,22 @@ uv run pytest
 
 ## Current Limitations
 
-- no authentication or authorization yet
-- no multi-tenant isolation
-- no schema migration framework yet
-- frontend graph editing is form-based rather than canvas-based
-- `echo_llm` is a placeholder provider, not a real vendor integration
-- no queue system beyond in-process background workers
+- no workspace or tenant isolation yet
+- no managed external queue adapter yet; local workers use SQLite-backed leases through the queue abstraction
+- no distributed worker deployment package yet
+- secret management still relies on application-level encrypted payloads, not an external KMS or vault
+- environment policy is enforceable, but policy authoring is still API-first
+- frontend graph editing is form-based rather than drag-and-drop
+- provider connection checks verify configuration but do not perform live vendor health probes by default
+- local knowledge search uses the SQLite development vector adapter; production Postgres deployments use the pgvector retrieval table and HNSW index
 
 ## Recommended Next Steps
 
-1. Add authentication, authorization, and multi-tenant boundaries.
-2. Add schema migrations for safe persistence upgrades.
-3. Add real provider plugins for external LLM vendors and operational tools.
-4. Improve the editor with drag-and-drop graph layout and branching visualization.
+1. Add workspace or tenant isolation around workflows, credentials, runs, knowledge bases, and audit logs.
+2. Implement a managed queue adapter, such as Redis, Postgres SKIP LOCKED, or a cloud queue, behind the queue interface.
+3. Add an external secret backend integration and key rotation story.
+4. Expand environment policy authoring and approval workflows in the UI.
+5. Add live provider health probes and alert delivery integrations.
 
 ## License
 

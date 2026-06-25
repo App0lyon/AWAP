@@ -157,3 +157,32 @@ def test_run_failure_is_tracked_per_step_and_job(tmp_path: Path) -> None:
     listed = client.get(f"/workflows/{workflow_id}/runs", headers=AUTH_HEADERS)
     assert listed.status_code == 200
     assert listed.json()[0]["id"] == run_id
+
+
+def test_run_events_can_be_streamed(tmp_path: Path) -> None:
+    with TestClient(create_app(database_url=_database_url(tmp_path))) as client:
+        created = client.post(
+            "/workflows",
+            json=_publishable_workflow_payload("Streaming workflow", "Streamed message"),
+            headers=AUTH_HEADERS,
+        )
+        workflow_id = created.json()["id"]
+        started = client.post(
+            f"/workflows/{workflow_id}/runs",
+            json={"input_payload": {}},
+            headers=AUTH_HEADERS,
+        )
+        assert started.status_code == 202
+        run_id = started.json()["id"]
+        _poll_run(client, run_id)
+
+        with client.stream(
+            "GET",
+            f"/runs/{run_id}/events/stream",
+            headers=AUTH_HEADERS,
+        ) as response:
+            assert response.status_code == 200
+            body = "".join(response.iter_text())
+
+        assert "data: " in body
+        assert "run.succeeded" in body

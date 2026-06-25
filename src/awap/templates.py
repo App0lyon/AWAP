@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from awap.domain import WorkflowDraftPayload, WorkflowNode, WorkflowEdge, WorkflowTemplateDefinition
-
+from awap.domain import WorkflowDraftPayload, WorkflowEdge, WorkflowNode, WorkflowTemplateDefinition
 
 BUILTIN_WORKFLOW_TEMPLATES: list[WorkflowTemplateDefinition] = [
     WorkflowTemplateDefinition(

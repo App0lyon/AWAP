@@ -4,10 +4,18 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
-from awap.domain import ApprovalDecision, CredentialSecret, WorkflowDefinition, WorkflowEdge, WorkflowEnvironmentDefinition, WorkflowNode
+from awap.domain import (
+    ApprovalDecision,
+    CredentialSecret,
+    WorkflowDefinition,
+    WorkflowEdge,
+    WorkflowEnvironmentDefinition,
+    WorkflowNode,
+)
 from awap.providers import ProviderRegistry
 
 SubworkflowInvoker = Callable[[str, int | None, dict[str, Any]], dict[str, Any]]
@@ -33,7 +41,14 @@ class WorkflowExecutionEngine:
         return {
             "workflow": {"id": workflow.id, "version": workflow.version, "name": workflow.name},
             "input": input_payload,
-            "environment": None if environment is None else {"name": environment.name, "variables": environment.variables},
+            "environment": None
+            if environment is None
+            else {
+                "name": environment.name,
+                "variables": environment.variables,
+                "policy": environment.policy.model_dump(),
+            },
+            "policy": None if environment is None else environment.policy.model_dump(),
             "steps": {},
             "last": None,
             "join_inputs": {},

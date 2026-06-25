@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from awap.auth import require_role
@@ -23,21 +25,25 @@ from awap.domain import (
     EvaluationRunCreateRequest,
     EvaluationRunDefinition,
     ExecutionPlan,
+    InfrastructureStatus,
     KnowledgeBaseCreateRequest,
     KnowledgeBaseDefinition,
     KnowledgeDocumentCreateRequest,
     KnowledgeDocumentDefinition,
     KnowledgeSearchResult,
+    MonitoringAlert,
     NodeTypeDefinition,
     ObservabilitySummary,
     PromptTemplateCreateRequest,
     PromptTemplateDefinition,
+    ProviderConnectionCheck,
     ProviderDefinition,
     SourceControlStatus,
     UserCreateRequest,
     UserDefinition,
     UserRole,
     UserWithToken,
+    WorkerHealthDefinition,
     WorkflowCommentCreateRequest,
     WorkflowCommentDefinition,
     WorkflowDefinition,
@@ -48,33 +54,43 @@ from awap.domain import (
     WorkflowExportBundle,
     WorkflowImportRequest,
     WorkflowPromotionRequest,
+    WorkflowReadinessReport,
     WorkflowRun,
     WorkflowRunEvent,
     WorkflowRunRequest,
     WorkflowRunStatus,
     WorkflowTemplateDefinition,
-    WorkflowValidationResult,
     WorkflowTriggerStateDefinition,
+    WorkflowValidationResult,
     WorkflowVersionDiff,
-    WorkerHealthDefinition,
 )
 from awap.repository import SqlAlchemyWorkflowRepository
 from awap.service import WorkflowService
 
 UI_DIR = Path(__file__).resolve().parent.parent / "ui"
 STATIC_DIR = UI_DIR / "static"
+LOCAL_MODE = "local"
+PRODUCTION_MODE = "production"
 
 
-def create_app(database_url: str | None = None, *, worker_count: int = 2) -> FastAPI:
+def create_app(database_url: str | None = None, *, worker_count: int | None = None) -> FastAPI:
+    mode = os.getenv("AWAP_MODE", LOCAL_MODE).lower()
+    resolved_worker_count = _resolve_worker_count(worker_count, mode)
+    bootstrap_token = os.getenv("AWAP_BOOTSTRAP_ADMIN_TOKEN")
+    if mode == PRODUCTION_MODE and not bootstrap_token:
+        raise RuntimeError("AWAP_BOOTSTRAP_ADMIN_TOKEN is required when AWAP_MODE=production.")
+    if bootstrap_token is None and mode != PRODUCTION_MODE:
+        bootstrap_token = "awap-dev-admin-token"
+
     engine = create_database_engine(database_url)
     initialize_database(engine)
     repository = SqlAlchemyWorkflowRepository(engine)
     service = WorkflowService(
         repository=repository,
         node_catalog=DEFAULT_NODE_CATALOG,
-        worker_count=worker_count,
+        worker_count=resolved_worker_count,
         bootstrap_username=os.getenv("AWAP_BOOTSTRAP_ADMIN_USERNAME", "admin"),
-        bootstrap_token=os.getenv("AWAP_BOOTSTRAP_ADMIN_TOKEN", "awap-dev-admin-token"),
+        bootstrap_token=bootstrap_token,
     )
 
     viewer_access = require_role(repository, UserRole.admin, UserRole.editor, UserRole.operator, UserRole.viewer)
@@ -118,6 +134,22 @@ def create_app(database_url: str | None = None, *, worker_count: int = 2) -> Fas
         del user
         return service.list_providers()
 
+    @app.get("/providers/{provider_key}/connection", response_model=ProviderConnectionCheck)
+    def provider_connection(
+        provider_key: str,
+        credential_id: str | None = Query(default=None),
+        environment: str | None = Query(default=None),
+        workflow_id: str | None = Query(default=None),
+        user: UserDefinition = Depends(viewer_access),
+    ) -> ProviderConnectionCheck:
+        del user
+        return service.check_provider_connection(
+            provider_key,
+            credential_id=credential_id,
+            environment=environment,
+            workflow_id=workflow_id,
+        )
+
     @app.get("/credentials", response_model=list[CredentialDefinition])
     def list_credentials(user: UserDefinition = Depends(editor_access)) -> list[CredentialDefinition]:
         del user
@@ -145,9 +177,14 @@ def create_app(database_url: str | None = None, *, worker_count: int = 2) -> Fas
         return service.create_knowledge_base(request, created_by=user.id)
 
     @app.get("/knowledge-bases/{knowledge_base_id}/documents", response_model=list[KnowledgeDocumentDefinition])
-    def list_knowledge_documents(knowledge_base_id: str, user: UserDefinition = Depends(viewer_access)) -> list[KnowledgeDocumentDefinition]:
+    def list_knowledge_documents(
+        knowledge_base_id: str,
+        limit: int | None = Query(default=None, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+        user: UserDefinition = Depends(viewer_access),
+    ) -> list[KnowledgeDocumentDefinition]:
         del user
-        return service.list_knowledge_documents(knowledge_base_id)
+        return service.list_knowledge_documents(knowledge_base_id, limit=limit, offset=offset)
 
     @app.post("/knowledge-documents", response_model=KnowledgeDocumentDefinition, status_code=201)
     def create_knowledge_document(request: KnowledgeDocumentCreateRequest, user: UserDefinition = Depends(editor_access)) -> KnowledgeDocumentDefinition:
@@ -161,19 +198,27 @@ def create_app(database_url: str | None = None, *, worker_count: int = 2) -> Fas
         knowledge_base_id: str,
         query: str = Query(..., min_length=1),
         top_k: int = Query(default=5, ge=1, le=20),
+        offset: int = Query(default=0, ge=0),
         user: UserDefinition = Depends(viewer_access),
     ) -> KnowledgeSearchResult:
         del user
-        return service.search_knowledge(knowledge_base_id, query, top_k=top_k)
+        return service.search_knowledge(knowledge_base_id, query, top_k=top_k, offset=offset)
 
     @app.get("/approval-tasks", response_model=list[ApprovalTaskDefinition])
     def list_approval_tasks(
         run_id: str | None = Query(default=None),
         decision: ApprovalDecision | None = Query(default=None),
+        limit: int | None = Query(default=None, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
         user: UserDefinition = Depends(operator_access),
     ) -> list[ApprovalTaskDefinition]:
         del user
-        return service.list_approval_tasks(run_id=run_id, decision=decision)
+        return service.list_approval_tasks(
+            run_id=run_id,
+            decision=decision,
+            limit=limit,
+            offset=offset,
+        )
 
     @app.post("/approval-tasks/{approval_task_id}/decision", response_model=ApprovalTaskDefinition)
     def decide_approval_task(
@@ -251,10 +296,12 @@ def create_app(database_url: str | None = None, *, worker_count: int = 2) -> Fas
     @app.get("/environments/{environment}/releases", response_model=list[WorkflowEnvironmentReleaseDefinition])
     def list_environment_releases(
         environment: str,
+        limit: int | None = Query(default=None, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
         user: UserDefinition = Depends(viewer_access),
     ) -> list[WorkflowEnvironmentReleaseDefinition]:
         del user
-        return service.list_environment_releases(environment=environment)
+        return service.list_environment_releases(environment=environment, limit=limit, offset=offset)
 
     @app.post("/workflows/{workflow_id}/promotions", response_model=WorkflowEnvironmentReleaseDefinition)
     def promote_workflow(
@@ -269,10 +316,33 @@ def create_app(database_url: str | None = None, *, worker_count: int = 2) -> Fas
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
 
+    @app.get("/workflows/{workflow_id}/versions/{version}/readiness", response_model=WorkflowReadinessReport)
+    def workflow_readiness(
+        workflow_id: str,
+        version: int,
+        environment: str | None = Query(default=None),
+        user: UserDefinition = Depends(viewer_access),
+    ) -> WorkflowReadinessReport:
+        del user
+        try:
+            return service.get_workflow_readiness(workflow_id, version, environment=environment)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="Workflow not found.") from error
+
     @app.get("/observability/summary", response_model=ObservabilitySummary)
     def observability_summary(user: UserDefinition = Depends(viewer_access)) -> ObservabilitySummary:
         del user
         return service.get_observability_summary()
+
+    @app.get("/observability/alerts", response_model=list[MonitoringAlert])
+    def observability_alerts(user: UserDefinition = Depends(viewer_access)) -> list[MonitoringAlert]:
+        del user
+        return service.get_monitoring_alerts()
+
+    @app.get("/infrastructure/status", response_model=InfrastructureStatus)
+    def infrastructure_status(user: UserDefinition = Depends(viewer_access)) -> InfrastructureStatus:
+        del user
+        return service.get_infrastructure_status()
 
     @app.get("/trigger-states", response_model=list[WorkflowTriggerStateDefinition])
     def list_trigger_states(user: UserDefinition = Depends(viewer_access)) -> list[WorkflowTriggerStateDefinition]:
@@ -282,10 +352,12 @@ def create_app(database_url: str | None = None, *, worker_count: int = 2) -> Fas
     @app.get("/dead-letters", response_model=list[DeadLetterDefinition])
     def list_dead_letters(
         workflow_id: str | None = Query(default=None),
+        limit: int | None = Query(default=None, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
         user: UserDefinition = Depends(operator_access),
     ) -> list[DeadLetterDefinition]:
         del user
-        return service.list_dead_letters(workflow_id=workflow_id)
+        return service.list_dead_letters(workflow_id=workflow_id, limit=limit, offset=offset)
 
     @app.get("/worker-health", response_model=list[WorkerHealthDefinition])
     def worker_health(user: UserDefinition = Depends(viewer_access)) -> list[WorkerHealthDefinition]:
@@ -303,19 +375,28 @@ def create_app(database_url: str | None = None, *, worker_count: int = 2) -> Fas
         return service.list_workflow_templates()
 
     @app.get("/workflows", response_model=list[WorkflowDefinition])
-    def list_workflows(user: UserDefinition = Depends(viewer_access)) -> list[WorkflowDefinition]:
+    def list_workflows(
+        limit: int | None = Query(default=None, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+        user: UserDefinition = Depends(viewer_access),
+    ) -> list[WorkflowDefinition]:
         del user
-        return service.list_workflows()
+        return service.list_workflows(limit=limit, offset=offset)
 
     @app.post("/workflows", response_model=WorkflowDefinition, status_code=201)
     def create_workflow(workflow: WorkflowDraftPayload, user: UserDefinition = Depends(editor_access)) -> WorkflowDefinition:
         return service.create_workflow(workflow, owner_id=user.id)
 
     @app.get("/workflows/{workflow_id}/versions", response_model=list[WorkflowDefinition])
-    def list_workflow_versions(workflow_id: str, user: UserDefinition = Depends(viewer_access)) -> list[WorkflowDefinition]:
+    def list_workflow_versions(
+        workflow_id: str,
+        limit: int | None = Query(default=None, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+        user: UserDefinition = Depends(viewer_access),
+    ) -> list[WorkflowDefinition]:
         del user
         try:
-            return service.list_workflow_versions(workflow_id)
+            return service.list_workflow_versions(workflow_id, limit=limit, offset=offset)
         except KeyError as error:
             raise HTTPException(status_code=404, detail="Workflow not found.") from error
 
@@ -352,10 +433,17 @@ def create_app(database_url: str | None = None, *, worker_count: int = 2) -> Fas
     def list_workflow_comments(
         workflow_id: str,
         workflow_version: int | None = Query(default=None, ge=1),
+        limit: int | None = Query(default=None, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
         user: UserDefinition = Depends(viewer_access),
     ) -> list[WorkflowCommentDefinition]:
         del user
-        return service.list_workflow_comments(workflow_id, workflow_version)
+        return service.list_workflow_comments(
+            workflow_id,
+            workflow_version,
+            limit=limit,
+            offset=offset,
+        )
 
     @app.post("/workflows/{workflow_id}/comments", response_model=WorkflowCommentDefinition, status_code=201)
     def create_workflow_comment(
@@ -372,10 +460,16 @@ def create_app(database_url: str | None = None, *, worker_count: int = 2) -> Fas
         workflow_id: str | None = Query(default=None),
         run_id: str | None = Query(default=None),
         limit: int = Query(default=100, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
         user: UserDefinition = Depends(admin_access),
     ) -> list[AuditLogEntry]:
         del user
-        return service.list_audit_logs(workflow_id=workflow_id, run_id=run_id, limit=limit)
+        return service.list_audit_logs(
+            workflow_id=workflow_id,
+            run_id=run_id,
+            limit=limit,
+            offset=offset,
+        )
 
     @app.get("/workflows/{workflow_id}", response_model=WorkflowDefinition)
     def get_workflow(workflow_id: str, version: int | None = Query(default=None, ge=1), user: UserDefinition = Depends(viewer_access)) -> WorkflowDefinition:
@@ -422,10 +516,15 @@ def create_app(database_url: str | None = None, *, worker_count: int = 2) -> Fas
             raise HTTPException(status_code=400, detail=str(error)) from error
 
     @app.get("/workflows/{workflow_id}/runs", response_model=list[WorkflowRun])
-    def list_workflow_runs(workflow_id: str, user: UserDefinition = Depends(viewer_access)) -> list[WorkflowRun]:
+    def list_workflow_runs(
+        workflow_id: str,
+        limit: int | None = Query(default=None, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+        user: UserDefinition = Depends(viewer_access),
+    ) -> list[WorkflowRun]:
         del user
         try:
-            return service.list_workflow_runs(workflow_id)
+            return service.list_workflow_runs(workflow_id, limit=limit, offset=offset)
         except KeyError as error:
             raise HTTPException(status_code=404, detail="Workflow not found.") from error
 
@@ -455,10 +554,17 @@ def create_app(database_url: str | None = None, *, worker_count: int = 2) -> Fas
         status: WorkflowRunStatus | None = Query(default=None),
         environment: str | None = Query(default=None),
         limit: int = Query(default=50, ge=1, le=200),
+        offset: int = Query(default=0, ge=0),
         user: UserDefinition = Depends(viewer_access),
     ) -> list[WorkflowRun]:
         del user
-        return service.search_runs(workflow_id=workflow_id, status=status, environment=environment, limit=limit)
+        return service.search_runs(
+            workflow_id=workflow_id,
+            status=status,
+            environment=environment,
+            limit=limit,
+            offset=offset,
+        )
 
     @app.get("/runs/{run_id}", response_model=WorkflowRun)
     def get_workflow_run(run_id: str, user: UserDefinition = Depends(viewer_access)) -> WorkflowRun:
@@ -503,11 +609,54 @@ def create_app(database_url: str | None = None, *, worker_count: int = 2) -> Fas
             raise HTTPException(status_code=400, detail=str(error)) from error
 
     @app.get("/runs/{run_id}/events", response_model=list[WorkflowRunEvent])
-    def list_workflow_run_events(run_id: str, user: UserDefinition = Depends(viewer_access)) -> list[WorkflowRunEvent]:
+    def list_workflow_run_events(
+        run_id: str,
+        limit: int | None = Query(default=None, ge=1, le=1000),
+        offset: int = Query(default=0, ge=0),
+        user: UserDefinition = Depends(viewer_access),
+    ) -> list[WorkflowRunEvent]:
         del user
         try:
-            return service.list_workflow_run_events(run_id)
+            return service.list_workflow_run_events(run_id, limit=limit, offset=offset)
         except KeyError as error:
             raise HTTPException(status_code=404, detail="Run not found.") from error
 
+    @app.get("/runs/{run_id}/events/stream")
+    async def stream_workflow_run_events(
+        run_id: str,
+        user: UserDefinition = Depends(viewer_access),
+    ) -> StreamingResponse:
+        del user
+        if service.get_workflow_run(run_id) is None:
+            raise HTTPException(status_code=404, detail="Run not found.")
+
+        async def event_stream():
+            offset = 0
+            while True:
+                events = service.list_workflow_run_events(run_id, offset=offset)
+                for event in events:
+                    offset += 1
+                    yield f"data: {json.dumps(event.model_dump(mode='json'))}\n\n"
+                run = service.get_workflow_run(run_id)
+                if run is None or run.status in {
+                    WorkflowRunStatus.succeeded,
+                    WorkflowRunStatus.failed,
+                    WorkflowRunStatus.cancelled,
+                }:
+                    break
+                await asyncio.sleep(0.5)
+
+        return StreamingResponse(event_stream(), media_type="text/event-stream")
+
     return app
+
+
+def _resolve_worker_count(explicit_worker_count: int | None, mode: str) -> int:
+    if explicit_worker_count is not None:
+        return explicit_worker_count
+    configured = os.getenv("AWAP_WORKER_COUNT")
+    if configured is not None:
+        return int(configured)
+    if mode == PRODUCTION_MODE:
+        return 0
+    return 2

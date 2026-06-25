@@ -221,6 +221,8 @@ class CredentialCreateRequest(BaseModel):
     kind: CredentialKind = CredentialKind.generic
     provider_key: str | None = None
     description: str = ""
+    environment_names: list[str] = Field(default_factory=list)
+    workflow_ids: list[str] = Field(default_factory=list)
     secret_payload: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -230,6 +232,8 @@ class CredentialDefinition(BaseModel):
     kind: CredentialKind = CredentialKind.generic
     provider_key: str | None = None
     description: str = ""
+    environment_names: list[str] = Field(default_factory=list)
+    workflow_ids: list[str] = Field(default_factory=list)
     created_at: datetime
     created_by: str | None = None
 
@@ -317,10 +321,19 @@ class UserWithToken(UserDefinition):
     token: str
 
 
+class EnvironmentPolicy(BaseModel):
+    allowed_http_hosts: list[str] = Field(default_factory=list)
+    allowed_file_write_roots: list[str] = Field(default_factory=lambda: ["/tmp"])
+    allowed_sql_database_paths: list[str] = Field(default_factory=list)
+    require_scoped_credentials: bool = False
+    redact_event_payloads: bool = True
+
+
 class WorkflowEnvironmentCreateRequest(BaseModel):
     name: str
     description: str = ""
     variables: dict[str, Any] = Field(default_factory=dict)
+    policy: EnvironmentPolicy = Field(default_factory=EnvironmentPolicy)
     is_default: bool = False
 
 
@@ -328,6 +341,7 @@ class WorkflowEnvironmentDefinition(BaseModel):
     name: str
     description: str = ""
     variables: dict[str, Any] = Field(default_factory=dict)
+    policy: EnvironmentPolicy = Field(default_factory=EnvironmentPolicy)
     is_default: bool = False
     created_at: datetime
 
@@ -397,6 +411,46 @@ class SourceControlStatus(BaseModel):
     head_commit: str | None = None
     dirty: bool = False
     changed_files: list[str] = Field(default_factory=list)
+
+
+class InfrastructureStatus(BaseModel):
+    deployment_model: str = "single_process"
+    queue_backend: str = "sqlite_lease_table"
+    worker_model: str = "in_process_threads"
+    durable_run_store: bool = True
+    distributed_workers_supported: bool = False
+    managed_queue_configured: bool = False
+    notes: list[str] = Field(default_factory=list)
+
+
+class MonitoringAlert(BaseModel):
+    severity: RunEventLevel = RunEventLevel.warning
+    title: str
+    message: str
+    run_id: str | None = None
+    workflow_id: str | None = None
+
+
+class ProviderConnectionCheck(BaseModel):
+    provider_key: str
+    available: bool
+    configured: bool
+    message: str
+
+
+class WorkflowReadinessCheck(BaseModel):
+    name: str
+    passed: bool
+    severity: RunEventLevel = RunEventLevel.error
+    message: str
+
+
+class WorkflowReadinessReport(BaseModel):
+    workflow_id: str
+    version: int
+    environment: str | None = None
+    ready: bool
+    checks: list[WorkflowReadinessCheck] = Field(default_factory=list)
 
 
 class WorkflowExportBundle(BaseModel):

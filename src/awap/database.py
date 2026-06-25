@@ -18,15 +18,27 @@ def get_database_url(explicit_url: str | None = None) -> str:
 
 
 def create_database_engine(database_url: str | None = None) -> Engine:
-    resolved_url = get_database_url(database_url)
-    connect_args = {"check_same_thread": False} if resolved_url.startswith("sqlite") else {}
-    return create_engine(
-        resolved_url,
-        future=True,
-        connect_args=connect_args,
-        pool_pre_ping=True,
-    )
+    resolved_url = _normalize_database_url(get_database_url(database_url))
+    is_sqlite = resolved_url.startswith("sqlite")
+    connect_args = {"check_same_thread": False} if is_sqlite else {}
+    engine_options: dict[str, object] = {
+        "future": True,
+        "connect_args": connect_args,
+        "pool_pre_ping": True,
+    }
+    if not is_sqlite:
+        engine_options["pool_size"] = int(os.getenv("AWAP_DATABASE_POOL_SIZE", "5"))
+        engine_options["max_overflow"] = int(os.getenv("AWAP_DATABASE_MAX_OVERFLOW", "10"))
+    return create_engine(resolved_url, **engine_options)
 
 
 def initialize_database(engine: Engine) -> None:
     apply_migrations(engine)
+
+
+def _normalize_database_url(database_url: str) -> str:
+    if database_url.startswith("postgres://"):
+        return "postgresql+psycopg://" + database_url.removeprefix("postgres://")
+    if database_url.startswith("postgresql://"):
+        return "postgresql+psycopg://" + database_url.removeprefix("postgresql://")
+    return database_url

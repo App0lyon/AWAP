@@ -8,8 +8,6 @@
   </head>
   <body>
     <div class="page-shell">
-      <div class="background-orb orb-one"></div>
-      <div class="background-orb orb-two"></div>
       <header class="hero">
         <div>
           <p class="eyebrow">AI Workflow Automation Platform</p>
@@ -82,6 +80,14 @@
               <span class="muted-label">Registry</span>
             </div>
             <div id="provider-list" class="stack-list compact-list"></div>
+          </section>
+
+          <section class="stack-section">
+            <div class="section-title-row">
+              <h3>Environments</h3>
+              <span class="muted-label">Promotion targets</span>
+            </div>
+            <div id="environment-list" class="stack-list compact-list"></div>
           </section>
 
           <section class="stack-section">
@@ -180,12 +186,39 @@
               <h3>Run Controls</h3>
               <span class="muted-label">Operator actions</span>
             </div>
+            <div class="control-grid">
+              <label class="field">
+                <span>Environment</span>
+                <select id="run-environment-select"></select>
+              </label>
+              <label class="field">
+                <span>Status Filter</span>
+                <select id="run-status-filter">
+                  <option value="">All statuses</option>
+                  <option value="queued">queued</option>
+                  <option value="running">running</option>
+                  <option value="waiting_human">waiting_human</option>
+                  <option value="succeeded">succeeded</option>
+                  <option value="failed">failed</option>
+                  <option value="cancelled">cancelled</option>
+                </select>
+              </label>
+            </div>
             <div class="toolbar">
               <button id="pause-run-button" class="button button-secondary">Pause</button>
               <button id="resume-run-button" class="button button-secondary">Resume</button>
               <button id="cancel-run-button" class="button button-secondary">Cancel</button>
               <button id="retry-run-button" class="button button-secondary">Retry Failed</button>
+              <button id="search-runs-button" class="button button-secondary">Search Runs</button>
             </div>
+          </section>
+
+          <section class="stack-section">
+            <div class="section-title-row">
+              <h3>Promotion</h3>
+              <button id="promote-version-button" class="button button-ghost">Promote Selected</button>
+            </div>
+            <div id="environment-release-list" class="stack-list compact-list"></div>
           </section>
 
           <section class="stack-section">
@@ -234,6 +267,20 @@
               <span id="run-event-caption" class="muted-label">No run selected</span>
             </div>
             <div id="run-event-list" class="event-list"></div>
+          </section>
+
+          <section class="stack-section">
+            <div class="section-title-row">
+              <h3>Approvals</h3>
+              <button id="refresh-approvals-button" class="button button-ghost">Refresh</button>
+            </div>
+            <textarea
+              id="approval-comment"
+              class="output-box"
+              spellcheck="true"
+              placeholder="Optional approval comment"
+            ></textarea>
+            <div id="approval-task-list" class="stack-list compact-list"></div>
           </section>
 
           <section class="stack-section">

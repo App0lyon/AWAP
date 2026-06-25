@@ -154,6 +154,35 @@ def test_workflow_versioning_and_publish_flow(tmp_path: Path) -> None:
         (1, "published"),
     ]
 
+    paged_versions = client.get(
+        f"/workflows/{workflow_id}/versions",
+        params={"limit": 1, "offset": 1},
+        headers=AUTH_HEADERS,
+    )
+    assert paged_versions.status_code == 200
+    assert [item["version"] for item in paged_versions.json()] == [1]
+
+
+def test_workflow_listing_is_paginated(tmp_path: Path) -> None:
+    client = TestClient(create_app(database_url=_database_url(tmp_path)))
+
+    for name in ["Alpha", "Beta", "Gamma"]:
+        created = client.post(
+            "/workflows",
+            json=_valid_workflow_payload(name=name),
+            headers=AUTH_HEADERS,
+        )
+        assert created.status_code == 201
+
+    response = client.get(
+        "/workflows",
+        params={"limit": 1, "offset": 1},
+        headers=AUTH_HEADERS,
+    )
+
+    assert response.status_code == 200
+    assert [workflow["name"] for workflow in response.json()] == ["Beta"]
+
 
 def test_publish_rejects_invalid_draft_version(tmp_path: Path) -> None:
     client = TestClient(create_app(database_url=_database_url(tmp_path)))

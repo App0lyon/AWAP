@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import threading
 import time
@@ -9,6 +10,7 @@ from collections import deque
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from awap.domain import (
     ApprovalDecision,
@@ -23,23 +25,28 @@ from awap.domain import (
     EvaluationRunDefinition,
     EvaluationStatus,
     ExecutionPlan,
+    InfrastructureStatus,
     KnowledgeBaseCreateRequest,
     KnowledgeBaseDefinition,
     KnowledgeDocumentCreateRequest,
     KnowledgeDocumentDefinition,
     KnowledgeSearchResult,
+    MonitoringAlert,
     NodeCategory,
     NodeTypeDefinition,
     ObservabilitySummary,
     PromptTemplateCreateRequest,
     PromptTemplateDefinition,
+    ProviderConnectionCheck,
     ProviderDefinition,
+    ProviderKind,
     RunEventLevel,
     SourceControlStatus,
     UserCreateRequest,
     UserDefinition,
     UserRole,
     UserWithToken,
+    WorkerHealthDefinition,
     WorkflowCommentCreateRequest,
     WorkflowCommentDefinition,
     WorkflowDefinition,
@@ -51,6 +58,8 @@ from awap.domain import (
     WorkflowExportBundle,
     WorkflowImportRequest,
     WorkflowPromotionRequest,
+    WorkflowReadinessCheck,
+    WorkflowReadinessReport,
     WorkflowRun,
     WorkflowRunEvent,
     WorkflowRunRequest,
@@ -61,10 +70,10 @@ from awap.domain import (
     WorkflowValidationResult,
     WorkflowValidator,
     WorkflowVersionDiff,
-    WorkerHealthDefinition,
 )
 from awap.evaluation import score_evaluation_case
 from awap.providers import ProviderRegistry, build_default_provider_registry
+from awap.queue import RunQueue, SQLiteRunQueue
 from awap.repository import WorkflowRepository
 from awap.runtime import ApprovalRequiredError, WorkflowExecutionEngine
 from awap.schedule import cron_matches, schedule_bucket, utc_now
@@ -80,9 +89,11 @@ class WorkflowService:
         *,
         worker_count: int = 2,
         bootstrap_username: str = "admin",
-        bootstrap_token: str = "awap-dev-admin-token",
+        bootstrap_token: str | None = "awap-dev-admin-token",
+        run_queue: RunQueue | None = None,
     ) -> None:
         self._repository = repository
+        self._run_queue = run_queue or SQLiteRunQueue(repository)
         self._node_catalog = node_catalog
         self._validator = WorkflowValidator(node_catalog=node_catalog)
         self._provider_registry = provider_registry or build_default_provider_registry(repository)
@@ -91,7 +102,8 @@ class WorkflowService:
         self._worker_threads: list[threading.Thread] = []
         self._worker_health: dict[str, WorkerHealthDefinition] = {}
         self._scheduler_thread: threading.Thread | None = None
-        self._repository.ensure_bootstrap_user(bootstrap_username, bootstrap_token, UserRole.admin)
+        if bootstrap_token is not None:
+            self._repository.ensure_bootstrap_user(bootstrap_username, bootstrap_token, UserRole.admin)
         self._repository.ensure_environment("dev", description="Development environment", is_default=True)
         self._repository.ensure_environment("staging", description="Staging environment")
         self._repository.ensure_environment("prod", description="Production environment")
@@ -135,18 +147,52 @@ class WorkflowService:
     def create_knowledge_document(self, request: KnowledgeDocumentCreateRequest, *, created_by: str | None = None) -> KnowledgeDocumentDefinition:
         return self._repository.create_knowledge_document(request, created_by=created_by)
 
-    def list_knowledge_documents(self, knowledge_base_id: str) -> list[KnowledgeDocumentDefinition]:
-        return self._repository.list_knowledge_documents(knowledge_base_id)
+    def list_knowledge_documents(
+        self,
+        knowledge_base_id: str,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[KnowledgeDocumentDefinition]:
+        return self._repository.list_knowledge_documents(
+            knowledge_base_id,
+            limit=limit,
+            offset=offset,
+        )
 
-    def search_knowledge(self, knowledge_base_id: str, query: str, *, top_k: int = 5) -> KnowledgeSearchResult:
+    def search_knowledge(
+        self,
+        knowledge_base_id: str,
+        query: str,
+        *,
+        top_k: int = 5,
+        offset: int = 0,
+    ) -> KnowledgeSearchResult:
         return KnowledgeSearchResult(
             knowledge_base_id=knowledge_base_id,
             query=query,
-            chunks=self._repository.search_knowledge(knowledge_base_id, query, top_k=top_k),
+            chunks=self._repository.search_knowledge(
+                knowledge_base_id,
+                query,
+                top_k=top_k,
+                offset=offset,
+            ),
         )
 
-    def list_approval_tasks(self, run_id: str | None = None, decision: ApprovalDecision | None = None) -> list[ApprovalTaskDefinition]:
-        return self._repository.list_approval_tasks(run_id=run_id, decision=decision)
+    def list_approval_tasks(
+        self,
+        run_id: str | None = None,
+        decision: ApprovalDecision | None = None,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[ApprovalTaskDefinition]:
+        return self._repository.list_approval_tasks(
+            run_id=run_id,
+            decision=decision,
+            limit=limit,
+            offset=offset,
+        )
 
     def decide_approval_task(
         self,
@@ -236,8 +282,151 @@ class WorkflowService:
     def list_environments(self) -> list[WorkflowEnvironmentDefinition]:
         return self._repository.list_environments()
 
-    def list_environment_releases(self, environment: str | None = None, workflow_id: str | None = None) -> list[WorkflowEnvironmentReleaseDefinition]:
-        return self._repository.list_environment_releases(environment=environment, workflow_id=workflow_id)
+    def list_environment_releases(
+        self,
+        environment: str | None = None,
+        workflow_id: str | None = None,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[WorkflowEnvironmentReleaseDefinition]:
+        return self._repository.list_environment_releases(
+            environment=environment,
+            workflow_id=workflow_id,
+            limit=limit,
+            offset=offset,
+        )
+
+    def get_workflow_readiness(
+        self,
+        workflow_id: str,
+        version: int,
+        *,
+        environment: str | None = None,
+    ) -> WorkflowReadinessReport:
+        workflow = self._require_workflow(workflow_id, version)
+        checks: list[WorkflowReadinessCheck] = []
+
+        validation = self._validator.validate(workflow)
+        checks.append(
+            WorkflowReadinessCheck(
+                name="graph_validation",
+                passed=validation.valid,
+                message="Workflow graph is valid." if validation.valid else "; ".join(validation.errors),
+            )
+        )
+
+        target_environment = None
+        if environment:
+            target_environment = self._repository.get_environment(environment)
+            checks.append(
+                WorkflowReadinessCheck(
+                    name="environment_exists",
+                    passed=target_environment is not None,
+                    message=f"Environment '{environment}' exists."
+                    if target_environment is not None
+                    else f"Environment '{environment}' does not exist.",
+                )
+            )
+
+        if workflow.version > 1:
+            checks.append(
+                WorkflowReadinessCheck(
+                    name="release_notes",
+                    passed=bool(workflow.release_notes.strip()),
+                    message="Release notes are present."
+                    if workflow.release_notes.strip()
+                    else "Release notes are required for versioned deployment review.",
+                    severity=RunEventLevel.warning,
+                )
+            )
+
+        provider_keys = {provider.key for provider in self._provider_registry.list_definitions()}
+        for node in workflow.nodes:
+            provider_key = node.config.get("provider")
+            if provider_key:
+                checks.append(
+                    WorkflowReadinessCheck(
+                        name=f"provider:{node.id}",
+                        passed=provider_key in provider_keys,
+                        message=f"Provider '{provider_key}' is registered for node '{node.id}'."
+                        if provider_key in provider_keys
+                        else f"Provider '{provider_key}' is not registered for node '{node.id}'.",
+                    )
+                )
+
+            credential_id = node.config.get("credential_id")
+            if credential_id:
+                credential = self._repository.get_credential_secret(
+                    credential_id,
+                    environment=environment,
+                    workflow_id=workflow.id,
+                )
+                checks.append(
+                    WorkflowReadinessCheck(
+                        name=f"credential:{node.id}",
+                        passed=credential is not None,
+                        message=f"Credential for node '{node.id}' is available in this scope."
+                        if credential is not None
+                        else f"Credential for node '{node.id}' is missing or not scoped to this workflow/environment.",
+                    )
+                )
+            elif target_environment is not None and target_environment.policy.require_scoped_credentials and node.type in {
+                "llm_prompt",
+                "ai_agent",
+                "http_request",
+            }:
+                checks.append(
+                    WorkflowReadinessCheck(
+                        name=f"credential_required:{node.id}",
+                        passed=False,
+                        message=f"Node '{node.id}' requires an environment-scoped credential.",
+                    )
+                )
+
+            if node.type == "knowledge_retrieval":
+                knowledge_base_id = str(node.config.get("knowledge_base_id") or "")
+                knowledge_base = (
+                    self._repository.get_knowledge_base(knowledge_base_id) if knowledge_base_id else None
+                )
+                checks.append(
+                    WorkflowReadinessCheck(
+                        name=f"knowledge_base:{node.id}",
+                        passed=knowledge_base is not None,
+                        message=f"Knowledge base for node '{node.id}' exists."
+                        if knowledge_base is not None
+                        else f"Node '{node.id}' references a missing knowledge base.",
+                    )
+                )
+
+            if node.type in {"sub_workflow", "for_each"}:
+                referenced_workflow_id = str(node.config.get("workflow_id") or "")
+                referenced = (
+                    self._repository.get(referenced_workflow_id, node.config.get("version"))
+                    if referenced_workflow_id
+                    else None
+                )
+                checks.append(
+                    WorkflowReadinessCheck(
+                        name=f"subworkflow:{node.id}",
+                        passed=referenced is not None,
+                        message=f"Referenced workflow for node '{node.id}' exists."
+                        if referenced is not None
+                        else f"Node '{node.id}' references a missing workflow.",
+                    )
+                )
+
+            if target_environment is not None:
+                checks.extend(self._check_environment_policy(workflow.id, node, target_environment))
+
+        ready = all(check.passed or check.severity is RunEventLevel.warning for check in checks)
+        return WorkflowReadinessReport(
+            workflow_id=workflow.id,
+            version=workflow.version,
+            environment=environment,
+            ready=ready,
+            checks=checks,
+        )
 
     def promote_workflow(self, workflow_id: str, request: WorkflowPromotionRequest, *, promoted_by: str | None = None) -> WorkflowEnvironmentReleaseDefinition:
         workflow = self._require_workflow(workflow_id, request.version)
@@ -246,21 +435,140 @@ class WorkflowService:
             raise ValueError("Cannot promote an invalid workflow version.")
         if self._repository.get_environment(request.environment) is None:
             raise KeyError(request.environment)
+        readiness = self.get_workflow_readiness(
+            workflow_id,
+            request.version,
+            environment=request.environment,
+        )
+        if not readiness.ready:
+            blockers = [check.message for check in readiness.checks if not check.passed]
+            raise ValueError("Workflow is not ready for promotion: " + "; ".join(blockers))
         release = self._repository.create_environment_release(request.environment, workflow_id, request.version, promoted_by=promoted_by)
         self._append_audit_log("workflow.promoted", actor_id=promoted_by, workflow_id=workflow_id, workflow_version=request.version, payload={"environment": request.environment})
         return release
 
-    def search_runs(self, *, workflow_id: str | None = None, status: WorkflowRunStatus | None = None, environment: str | None = None, limit: int = 50) -> list[WorkflowRun]:
-        return self._repository.search_runs(workflow_id=workflow_id, status=status, environment=environment, limit=limit)
+    def search_runs(
+        self,
+        *,
+        workflow_id: str | None = None,
+        status: WorkflowRunStatus | None = None,
+        environment: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[WorkflowRun]:
+        return self._repository.search_runs(
+            workflow_id=workflow_id,
+            status=status,
+            environment=environment,
+            limit=limit,
+            offset=offset,
+        )
 
     def get_observability_summary(self) -> ObservabilitySummary:
         return self._repository.build_observability_summary()
 
+    def get_monitoring_alerts(self) -> list[MonitoringAlert]:
+        alerts: list[MonitoringAlert] = []
+        failed_runs = self._repository.search_runs(status=WorkflowRunStatus.failed, limit=10)
+        for run in failed_runs:
+            alerts.append(
+                MonitoringAlert(
+                    severity=RunEventLevel.error,
+                    title="Workflow run failed",
+                    message=run.error_message or "A workflow run failed without an error message.",
+                    run_id=run.id,
+                    workflow_id=run.workflow_id,
+                )
+            )
+        for dead_letter in self._repository.list_dead_letters(limit=10):
+            alerts.append(
+                MonitoringAlert(
+                    severity=RunEventLevel.error,
+                    title="Dead letter captured",
+                    message=dead_letter.error_message,
+                    run_id=dead_letter.run_id,
+                    workflow_id=dead_letter.workflow_id,
+                )
+            )
+        stale_after = datetime.now(UTC) - timedelta(seconds=60)
+        for worker in self._worker_health.values():
+            if worker.updated_at < stale_after:
+                alerts.append(
+                    MonitoringAlert(
+                        severity=RunEventLevel.warning,
+                        title="Worker heartbeat is stale",
+                        message=f"Worker '{worker.worker_id}' has not reported health recently.",
+                    )
+                )
+        return alerts
+
+    def get_infrastructure_status(self) -> InfrastructureStatus:
+        return InfrastructureStatus(
+            queue_backend=self._run_queue.backend_name,
+            notes=[
+                "Runs and leases are durable in the SQL database.",
+                "Workers use a queue adapter; local development uses the SQLite lease-table adapter.",
+                "A managed queue backend is still required for production-grade distributed execution.",
+            ]
+        )
+
+    def check_provider_connection(
+        self,
+        provider_key: str,
+        *,
+        credential_id: str | None = None,
+        environment: str | None = None,
+        workflow_id: str | None = None,
+    ) -> ProviderConnectionCheck:
+        providers = {provider.key: provider for provider in self._provider_registry.list_definitions()}
+        provider = providers.get(provider_key)
+        if provider is None:
+            return ProviderConnectionCheck(
+                provider_key=provider_key,
+                available=False,
+                configured=False,
+                message=f"Provider '{provider_key}' is not registered.",
+            )
+        if provider.kind is not ProviderKind.llm:
+            return ProviderConnectionCheck(
+                provider_key=provider_key,
+                available=True,
+                configured=True,
+                message=f"Provider '{provider_key}' is available.",
+            )
+        credential = (
+            self._repository.get_credential_secret(
+                credential_id,
+                environment=environment,
+                workflow_id=workflow_id,
+            )
+            if credential_id
+            else None
+        )
+        configured = bool(
+            credential
+            and (credential.secret_payload.get("bearer_token") or credential.secret_payload.get("api_key"))
+        ) or bool(os.getenv("NVIDIA_API_KEY"))
+        return ProviderConnectionCheck(
+            provider_key=provider_key,
+            available=True,
+            configured=configured,
+            message="Provider credentials are configured."
+            if configured
+            else "Provider is registered but no usable credential or environment API key is configured.",
+        )
+
     def list_trigger_states(self) -> list[WorkflowTriggerStateDefinition]:
         return self._repository.list_trigger_states()
 
-    def list_dead_letters(self, workflow_id: str | None = None) -> list[DeadLetterDefinition]:
-        return self._repository.list_dead_letters(workflow_id=workflow_id)
+    def list_dead_letters(
+        self,
+        workflow_id: str | None = None,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[DeadLetterDefinition]:
+        return self._repository.list_dead_letters(workflow_id=workflow_id, limit=limit, offset=offset)
 
     def list_worker_health(self) -> list[WorkerHealthDefinition]:
         return sorted(self._worker_health.values(), key=lambda item: item.worker_id)
@@ -287,11 +595,34 @@ class WorkflowService:
         self._append_audit_log("workflow.comment_created", actor_id=author_id, workflow_id=request.workflow_id, workflow_version=request.workflow_version, payload={"comment_id": comment.id})
         return comment
 
-    def list_workflow_comments(self, workflow_id: str, workflow_version: int | None = None) -> list[WorkflowCommentDefinition]:
-        return self._repository.list_comments(workflow_id, workflow_version)
+    def list_workflow_comments(
+        self,
+        workflow_id: str,
+        workflow_version: int | None = None,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[WorkflowCommentDefinition]:
+        return self._repository.list_comments(
+            workflow_id,
+            workflow_version,
+            limit=limit,
+            offset=offset,
+        )
 
-    def list_audit_logs(self, workflow_id: str | None = None, run_id: str | None = None, limit: int = 100) -> list[AuditLogEntry]:
-        return self._repository.list_audit_logs(workflow_id=workflow_id, run_id=run_id, limit=limit)
+    def list_audit_logs(
+        self,
+        workflow_id: str | None = None,
+        run_id: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[AuditLogEntry]:
+        return self._repository.list_audit_logs(
+            workflow_id=workflow_id,
+            run_id=run_id,
+            limit=limit,
+            offset=offset,
+        )
 
     def compare_workflow_versions(self, workflow_id: str, from_version: int, to_version: int) -> WorkflowVersionDiff:
         left = self._require_workflow(workflow_id, from_version)
@@ -355,8 +686,14 @@ class WorkflowService:
         self._append_audit_log("workflow.version_created", actor_id=actor_id, workflow_id=created.id, workflow_version=created.version, payload={"name": created.name})
         return created
 
-    def list_workflow_versions(self, workflow_id: str) -> list[WorkflowDefinition]:
-        versions = self._repository.list_versions(workflow_id)
+    def list_workflow_versions(
+        self,
+        workflow_id: str,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[WorkflowDefinition]:
+        versions = self._repository.list_versions(workflow_id, limit=limit, offset=offset)
         if not versions:
             raise KeyError(workflow_id)
         return versions
@@ -372,8 +709,8 @@ class WorkflowService:
         self._append_audit_log("workflow.published", workflow_id=workflow_id, workflow_version=version, payload={"state": "published"})
         return published
 
-    def list_workflows(self) -> list[WorkflowDefinition]:
-        return self._repository.list()
+    def list_workflows(self, *, limit: int | None = None, offset: int = 0) -> list[WorkflowDefinition]:
+        return self._repository.list(limit=limit, offset=offset)
 
     def get_workflow(self, workflow_id: str, version: int | None = None) -> WorkflowDefinition | None:
         return self._repository.get(workflow_id, version)
@@ -452,6 +789,15 @@ class WorkflowService:
         validation = self._validator.validate(workflow)
         if not validation.valid:
             raise ValueError("Cannot start a run for an invalid workflow version.")
+        if request.environment:
+            readiness = self.get_workflow_readiness(
+                workflow.id,
+                workflow.version,
+                environment=request.environment,
+            )
+            if not readiness.ready:
+                blockers = [check.message for check in readiness.checks if not check.passed]
+                raise ValueError("Cannot start an environment run: " + "; ".join(blockers))
         if request.idempotency_key:
             existing = self._repository.find_run_by_idempotency_key(workflow.id, request.idempotency_key)
             if existing is not None:
@@ -508,19 +854,31 @@ class WorkflowService:
         self._append_audit_log("run.retried", workflow_id=run.workflow_id, workflow_version=run.workflow_version, run_id=run.id, payload={"retry_of_run_id": source_run.id, "resume_from_step_index": resume_from_step_index})
         return run
 
-    def list_workflow_runs(self, workflow_id: str) -> list[WorkflowRun]:
+    def list_workflow_runs(
+        self,
+        workflow_id: str,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[WorkflowRun]:
         if self._repository.get(workflow_id) is None:
             raise KeyError(workflow_id)
-        return self._repository.list_runs(workflow_id)
+        return self._repository.list_runs(workflow_id, limit=limit, offset=offset)
 
     def get_workflow_run(self, run_id: str) -> WorkflowRun | None:
         return self._repository.get_run(run_id)
 
-    def list_workflow_run_events(self, run_id: str) -> list[WorkflowRunEvent]:
+    def list_workflow_run_events(
+        self,
+        run_id: str,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[WorkflowRunEvent]:
         run = self._repository.get_run(run_id)
         if run is None:
             raise KeyError(run_id)
-        return self._repository.list_run_events(run_id)
+        return self._repository.list_run_events(run_id, limit=limit, offset=offset)
 
     def shutdown(self) -> None:
         self._stop_event.set()
@@ -532,7 +890,7 @@ class WorkflowService:
     def _worker_loop(self, worker_id: str) -> None:
         while not self._stop_event.is_set():
             self._worker_health[worker_id] = self._worker_health[worker_id].model_copy(update={"leased_run_id": None, "updated_at": datetime.now(UTC)})
-            run = self._repository.claim_next_queued_run(worker_id, lease_seconds=30)
+            run = self._run_queue.claim_next_run(worker_id, lease_seconds=30)
             if run is None:
                 time.sleep(0.1)
                 continue
@@ -604,7 +962,7 @@ class WorkflowService:
             enqueued = set(state.get("enqueued", []))
             executed = set(state.get("executed", []))
             join_tokens = {key: int(value) for key, value in state.get("join_tokens", {}).items()}
-            step_results = list(state.get("step_results", []))
+            step_results = self._step_results_from_run(run)
             attempts = {key: int(value) for key, value in state.get("attempts", {}).items()}
             context = state.get("context") or self._runtime.create_context(workflow, run.input_payload, environment)
         else:
@@ -667,7 +1025,15 @@ class WorkflowService:
                 self._repository.mark_step_running(run.id, step.index)
                 provider_key = node.config.get("provider")
                 credential_id = node.config.get("credential_id")
-                credential = self._repository.get_credential_secret(credential_id) if credential_id is not None else None
+                credential = (
+                    self._repository.get_credential_secret(
+                        credential_id,
+                        environment=run.environment,
+                        workflow_id=workflow.id,
+                    )
+                    if credential_id is not None
+                    else None
+                )
                 self._emit_event(run_id=run.id, workflow=workflow, event_type="step.started", message=f"Step {step.index} started.", provider_key=provider_key, step_index=step.index, payload={"node_id": step.node_id, "node_type": step.node_type})
 
                 try:
@@ -819,11 +1185,31 @@ class WorkflowService:
                 "enqueued": sorted(enqueued),
                 "executed": sorted(executed),
                 "join_tokens": join_tokens,
-                "step_results": step_results,
+                "step_result_count": len(step_results),
                 "context": context,
                 "attempts": attempts,
             },
         )
+
+    def _step_results_from_run(self, run: WorkflowRun) -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        for step in sorted(run.steps, key=lambda item: item.index):
+            if step.output_payload is None:
+                continue
+            if step.status not in {
+                WorkflowRunStepStatus.succeeded,
+                WorkflowRunStepStatus.copied,
+            }:
+                continue
+            results.append(
+                {
+                    "step_index": step.index,
+                    "node_id": step.node_id,
+                    "output": step.output_payload,
+                    "copied": step.status == WorkflowRunStepStatus.copied,
+                }
+            )
+        return results
 
     def _mark_remaining_steps(self, run_id: str, status: WorkflowRunStepStatus, message: str) -> None:
         current_run = self._repository.get_run(run_id)
@@ -916,7 +1302,11 @@ class WorkflowService:
                 continue
             node = node_map[node_id]
             credential_id = node.config.get("credential_id")
-            credential = self._repository.get_credential_secret(credential_id) if credential_id is not None else None
+            credential = (
+                self._repository.get_credential_secret(credential_id, workflow_id=workflow.id)
+                if credential_id is not None
+                else None
+            )
             output_payload = self._runtime.execute_node(node, context, credential, invoke_subworkflow=self._invoke_subworkflow)
             self._runtime.update_context(context, node, output_payload)
             executed.add(node_id)
@@ -964,6 +1354,86 @@ class WorkflowService:
         ]
         return fallback
 
+    def _check_environment_policy(
+        self,
+        workflow_id: str,
+        node: Any,
+        environment: WorkflowEnvironmentDefinition,
+    ) -> list[WorkflowReadinessCheck]:
+        checks: list[WorkflowReadinessCheck] = []
+        policy = environment.policy
+        if node.type == "http_request" and policy.allowed_http_hosts:
+            host = urlparse(str(node.config.get("url") or "")).hostname
+            checks.append(
+                WorkflowReadinessCheck(
+                    name=f"http_policy:{node.id}",
+                    passed=host in policy.allowed_http_hosts,
+                    message=f"HTTP host '{host}' is allowed in environment '{environment.name}'."
+                    if host in policy.allowed_http_hosts
+                    else f"HTTP host '{host}' is not allowed in environment '{environment.name}'.",
+                )
+            )
+        if node.type == "file_write":
+            configured_path = str(node.config.get("path") or "")
+            resolved_path = Path(configured_path).expanduser().resolve() if configured_path else None
+            allowed_roots = [Path(root).expanduser().resolve() for root in policy.allowed_file_write_roots]
+            allowed = (
+                resolved_path is not None
+                and any(resolved_path == root or root in resolved_path.parents for root in allowed_roots)
+            )
+            checks.append(
+                WorkflowReadinessCheck(
+                    name=f"file_policy:{node.id}",
+                    passed=allowed,
+                    message=f"File write path for node '{node.id}' is inside an allowed root."
+                    if allowed
+                    else f"File write path for node '{node.id}' is outside allowed roots.",
+                )
+            )
+        if node.type == "sql_query" and policy.allowed_sql_database_paths:
+            configured_path = str(node.config.get("database_path") or "")
+            resolved_path = str(Path(configured_path).expanduser().resolve()) if configured_path else ""
+            allowed_paths = [str(Path(path).expanduser().resolve()) for path in policy.allowed_sql_database_paths]
+            checks.append(
+                WorkflowReadinessCheck(
+                    name=f"sql_policy:{node.id}",
+                    passed=resolved_path in allowed_paths,
+                    message=f"SQL database path for node '{node.id}' is allowed."
+                    if resolved_path in allowed_paths
+                    else f"SQL database path for node '{node.id}' is not allowed in environment '{environment.name}'.",
+                )
+            )
+        return checks
+
+    def _redact_payload(self, payload: Any) -> Any:
+        sensitive_keys = {
+            "api_key",
+            "authorization",
+            "bearer_token",
+            "body",
+            "content",
+            "headers",
+            "input_payload",
+            "output",
+            "password",
+            "prompt",
+            "response",
+            "secret",
+            "secret_payload",
+            "token",
+        }
+        if isinstance(payload, dict):
+            redacted: dict[str, Any] = {}
+            for key, value in payload.items():
+                if key.lower() in sensitive_keys:
+                    redacted[key] = "[redacted]"
+                else:
+                    redacted[key] = self._redact_payload(value)
+            return redacted
+        if isinstance(payload, list):
+            return [self._redact_payload(item) for item in payload]
+        return payload
+
     def _append_audit_log(
         self,
         action: str,
@@ -987,5 +1457,16 @@ class WorkflowService:
         )
 
     def _emit_event(self, *, run_id: str, workflow: WorkflowDefinition, event_type: str, message: str, level: RunEventLevel = RunEventLevel.info, provider_key: str | None = None, step_index: int | None = None, payload: dict[str, Any] | None = None) -> None:
-        event = WorkflowRunEvent(run_id=run_id, workflow_id=workflow.id, workflow_version=workflow.version, level=level, event_type=event_type, message=message, timestamp=datetime.now(UTC), provider_key=provider_key, step_index=step_index, payload=payload or {})
+        event = WorkflowRunEvent(
+            run_id=run_id,
+            workflow_id=workflow.id,
+            workflow_version=workflow.version,
+            level=level,
+            event_type=event_type,
+            message=message,
+            timestamp=datetime.now(UTC),
+            provider_key=provider_key,
+            step_index=step_index,
+            payload=self._redact_payload(payload or {}),
+        )
         self._provider_registry.emit(event)

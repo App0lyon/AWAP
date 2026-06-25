@@ -35,6 +35,9 @@ def apply_migrations(engine: Engine) -> None:
         (3, _migration_3_add_priority_one_tables),
         (4, _migration_4_add_priority_two_tables),
         (5, _migration_5_add_priority_three_tables),
+        (6, _migration_6_add_environment_policy_and_credential_scopes),
+        (7, _migration_7_add_performance_indexes),
+        (8, _migration_8_add_pgvector_retrieval_backend),
     ]
     for version, migration in migrations:
         if version in existing_versions:
@@ -116,6 +119,132 @@ def _migration_5_add_priority_three_tables(engine: Engine) -> None:
         _ensure_column(engine, inspector, "workflows", "owner_id", "VARCHAR(36)")
 
 
+def _migration_6_add_environment_policy_and_credential_scopes(engine: Engine) -> None:
+    Base.metadata.create_all(engine)
+    inspector = inspect(engine)
+    if "workflow_environments" in inspector.get_table_names():
+        _ensure_column(engine, inspector, "workflow_environments", "policy", "JSON DEFAULT '{}'")
+    if "workflow_credentials" in inspector.get_table_names():
+        _ensure_column(engine, inspector, "workflow_credentials", "environment_names", "JSON DEFAULT '[]'")
+        _ensure_column(engine, inspector, "workflow_credentials", "workflow_ids", "JSON DEFAULT '[]'")
+
+
+def _migration_7_add_performance_indexes(engine: Engine) -> None:
+    Base.metadata.create_all(engine)
+    indexes = [
+        ("ix_workflows_workflow_version", "workflows", "workflow_id, version"),
+        ("ix_workflows_state_name_version", "workflows", "state, name, version"),
+        ("ix_workflow_runs_claim_queue", "workflow_runs", "status, created_at"),
+        (
+            "ix_workflow_runs_search",
+            "workflow_runs",
+            "workflow_id, status, environment, created_at",
+        ),
+        ("ix_workflow_run_events_run_time", "workflow_run_events", "run_id, timestamp"),
+        (
+            "ix_workflow_run_events_workflow_time",
+            "workflow_run_events",
+            "workflow_id, workflow_version, timestamp",
+        ),
+        (
+            "ix_approval_tasks_decision_created",
+            "approval_tasks",
+            "decision, created_at",
+        ),
+        (
+            "ix_approval_tasks_run_step_decision",
+            "approval_tasks",
+            "run_id, step_index, decision",
+        ),
+        (
+            "ix_environment_releases_env_workflow",
+            "workflow_environment_releases",
+            "environment, workflow_id",
+        ),
+        (
+            "ix_audit_logs_workflow_created",
+            "audit_logs",
+            "workflow_id, created_at",
+        ),
+        ("ix_audit_logs_run_created", "audit_logs", "run_id, created_at"),
+        (
+            "ix_dead_letters_workflow_created",
+            "workflow_dead_letters",
+            "workflow_id, created_at",
+        ),
+        (
+            "ix_workflow_comments_version_created",
+            "workflow_comments",
+            "workflow_id, workflow_version, created_at",
+        ),
+        (
+            "ix_knowledge_chunks_base_document",
+            "knowledge_chunks",
+            "knowledge_base_id, document_id",
+        ),
+    ]
+    for index_name, table_name, columns in indexes:
+        _ensure_index(engine, table_name, index_name, columns)
+
+
+def _migration_8_add_pgvector_retrieval_backend(engine: Engine) -> None:
+    if engine.dialect.name != "postgresql":
+        return
+    with engine.begin() as connection:
+        connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+        connection.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS knowledge_vectors (
+                    chunk_id VARCHAR(36) PRIMARY KEY
+                        REFERENCES knowledge_chunks(id) ON DELETE CASCADE,
+                    knowledge_base_id VARCHAR(36) NOT NULL,
+                    document_id VARCHAR(36) NOT NULL,
+                    embedding vector(64) NOT NULL
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO knowledge_vectors (
+                    chunk_id,
+                    knowledge_base_id,
+                    document_id,
+                    embedding
+                )
+                SELECT
+                    id,
+                    knowledge_base_id,
+                    document_id,
+                    ('[' || array_to_string(
+                        ARRAY(SELECT jsonb_array_elements_text(embedding::jsonb)),
+                        ','
+                    ) || ']')::vector
+                FROM knowledge_chunks
+                ON CONFLICT (chunk_id) DO NOTHING
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS ix_knowledge_vectors_base_document
+                ON knowledge_vectors (knowledge_base_id, document_id)
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS ix_knowledge_vectors_embedding_hnsw
+                ON knowledge_vectors USING hnsw (embedding vector_cosine_ops)
+                """
+            )
+        )
+
+
 def _ensure_column(
     engine: Engine,
     inspector: Any,
@@ -128,6 +257,17 @@ def _ensure_column(
         return
     with engine.begin() as connection:
         connection.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}"))
+
+
+def _ensure_index(engine: Engine, table_name: str, index_name: str, columns: str) -> None:
+    inspector = inspect(engine)
+    if table_name not in inspector.get_table_names():
+        return
+    existing_indexes = {index["name"] for index in inspector.get_indexes(table_name)}
+    if index_name in existing_indexes:
+        return
+    with engine.begin() as connection:
+        connection.execute(text(f"CREATE INDEX IF NOT EXISTS {index_name} ON {table_name} ({columns})"))
 
 
 def _migrate_credential_payloads(engine: Engine) -> None:

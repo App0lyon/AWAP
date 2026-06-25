@@ -9,8 +9,15 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Protocol
 from urllib import error, request
+from urllib.parse import urlparse
 
-from awap.domain import CredentialSecret, KnowledgeChunk, ProviderDefinition, ProviderKind, RunEventLevel, WorkflowRunEvent
+from awap.domain import (
+    CredentialSecret,
+    ProviderDefinition,
+    ProviderKind,
+    RunEventLevel,
+    WorkflowRunEvent,
+)
 from awap.repository import WorkflowRepository
 
 LOGGER = logging.getLogger(__name__)
@@ -106,10 +113,11 @@ class HttpToolProvider:
     )
 
     def execute(self, *, node_type: str, config: dict[str, Any], credential: CredentialSecret | None, context: dict[str, Any]) -> dict[str, Any]:
-        del node_type, context
+        del node_type
         mock_response = config.get("mock_response")
         if mock_response is not None:
             return {"provider": self.definition.key, "request": {"method": config["method"].upper(), "url": config["url"]}, "response": mock_response}
+        _enforce_http_policy(config, context)
         headers = dict(config.get("headers", {}))
         if credential is not None:
             secret_payload = credential.secret_payload
@@ -151,8 +159,9 @@ class SQLiteToolProvider:
     )
 
     def execute(self, *, node_type: str, config: dict[str, Any], credential: CredentialSecret | None, context: dict[str, Any]) -> dict[str, Any]:
-        del node_type, credential, context
+        del node_type, credential
         database_path = Path(config.get("database_path", "awap.db"))
+        _enforce_sql_policy(database_path, context)
         connection = sqlite3.connect(database_path)
         try:
             cursor = connection.execute(config["query"], config.get("parameters", []))
@@ -176,8 +185,9 @@ class FileWriteToolProvider:
     )
 
     def execute(self, *, node_type: str, config: dict[str, Any], credential: CredentialSecret | None, context: dict[str, Any]) -> dict[str, Any]:
-        del node_type, credential, context
+        del node_type, credential
         target = Path(config["path"]).resolve()
+        _enforce_file_policy(target, context)
         target.parent.mkdir(parents=True, exist_ok=True)
         content = config["content"]
         target.write_text(content, encoding="utf-8")
@@ -305,3 +315,37 @@ def build_default_provider_registry(repository: WorkflowRepository) -> ProviderR
         },
         observability_providers=[RepositoryObservabilityProvider(repository), LoggerObservabilityProvider()],
     )
+
+
+def _context_policy(context: dict[str, Any]) -> dict[str, Any]:
+    policy = context.get("policy")
+    return policy if isinstance(policy, dict) else {}
+
+
+def _enforce_http_policy(config: dict[str, Any], context: dict[str, Any]) -> None:
+    allowed_hosts = _context_policy(context).get("allowed_http_hosts") or []
+    if not allowed_hosts:
+        return
+    host = urlparse(str(config.get("url") or "")).hostname
+    if host not in allowed_hosts:
+        raise RuntimeError(f"HTTP host '{host}' is not allowed by the environment policy.")
+
+
+def _enforce_sql_policy(database_path: Path, context: dict[str, Any]) -> None:
+    allowed_paths = _context_policy(context).get("allowed_sql_database_paths") or []
+    if not allowed_paths:
+        return
+    resolved = str(database_path.expanduser().resolve())
+    allowed = {str(Path(path).expanduser().resolve()) for path in allowed_paths}
+    if resolved not in allowed:
+        raise RuntimeError("SQL database path is not allowed by the environment policy.")
+
+
+def _enforce_file_policy(target: Path, context: dict[str, Any]) -> None:
+    policy = _context_policy(context)
+    allowed_roots = policy.get("allowed_file_write_roots")
+    if allowed_roots is None:
+        return
+    roots = [Path(root).expanduser().resolve() for root in allowed_roots]
+    if not any(target == root or root in target.parents for root in roots):
+        raise RuntimeError("File write path is not allowed by the environment policy.")
