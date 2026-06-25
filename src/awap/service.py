@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import threading
@@ -11,7 +12,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+from uuid import uuid4
 
+from awap.artifacts import ARTIFACT_REFERENCE_KEY, LocalArtifactStore
 from awap.domain import (
     ApprovalDecision,
     ApprovalDecisionRequest,
@@ -98,6 +101,10 @@ class WorkflowService:
         self._validator = WorkflowValidator(node_catalog=node_catalog)
         self._provider_registry = provider_registry or build_default_provider_registry(repository)
         self._runtime = WorkflowExecutionEngine(self._provider_registry)
+        self._stored_payload_limit_bytes = int(os.getenv("AWAP_MAX_STORED_PAYLOAD_BYTES", "32768"))
+        self._artifact_store = LocalArtifactStore(
+            Path(os.getenv("AWAP_ARTIFACT_DIR", "/tmp/awap-artifacts"))
+        )
         self._stop_event = threading.Event()
         self._worker_threads: list[threading.Thread] = []
         self._worker_health: dict[str, WorkerHealthDefinition] = {}
@@ -206,7 +213,7 @@ class WorkflowService:
             raise KeyError(approval_task_id)
         run = self._repository.get_run(task.run_id)
         if run is not None:
-            execution_state = dict(run.execution_state or {})
+            execution_state = dict(self._materialize_stored_payload(run.execution_state or {}))
             context = dict(execution_state.get("context") or {})
             approvals = dict(context.get("approvals") or {})
             approvals[task.node_id] = {
@@ -216,7 +223,14 @@ class WorkflowService:
             }
             context["approvals"] = approvals
             execution_state["context"] = context
-            self._repository.update_run_execution_state(task.run_id, execution_state)
+            self._repository.update_run_execution_state(
+                task.run_id,
+                self._prepare_stored_payload(
+                    execution_state,
+                    run_id=task.run_id,
+                    label="run.execution_state",
+                ),
+            )
         if run is not None and run.status == WorkflowRunStatus.waiting_human:
             self._repository.resume_run(task.run_id)
         self._append_audit_log("approval.decided", actor_id=decided_by, workflow_id=task.workflow_id, workflow_version=task.workflow_version, run_id=task.run_id, payload={"approval_task_id": task.id, "decision": request.decision.value})
@@ -806,7 +820,22 @@ class WorkflowService:
             raise ValueError("Workflow concurrency limit reached.")
         plan = self._validator.create_execution_plan(workflow)
         timeout_seconds = request.timeout_seconds or workflow.settings.run_timeout_seconds
-        run = self._repository.create_run(workflow, plan, request.input_payload, environment=request.environment, trigger_node_ids=trigger_node_ids, idempotency_key=request.idempotency_key, timeout_seconds=timeout_seconds)
+        run_id = str(uuid4())
+        stored_input_payload = self._prepare_stored_payload(
+            request.input_payload,
+            run_id=run_id,
+            label="run.input_payload",
+        )
+        run = self._repository.create_run(
+            workflow,
+            plan,
+            stored_input_payload,
+            run_id=run_id,
+            environment=request.environment,
+            trigger_node_ids=trigger_node_ids,
+            idempotency_key=request.idempotency_key,
+            timeout_seconds=timeout_seconds,
+        )
         self._emit_event(run_id=run.id, workflow=workflow, event_type="run.queued", message="Workflow run queued.", payload={"input_payload": request.input_payload, "idempotency_key": request.idempotency_key, "environment": request.environment, "trigger_node_ids": trigger_node_ids or []})
         return run
 
@@ -849,7 +878,24 @@ class WorkflowService:
             if failed_step is None:
                 raise ValueError("Run has no failed or cancelled step to retry from.")
             resume_from_step_index = failed_step.index
-        run = self._repository.create_run(workflow, plan, source_run.input_payload, environment=source_run.environment, trigger_node_ids=source_run.trigger_node_ids, retry_of_run_id=source_run.id, resume_from_step_index=resume_from_step_index, timeout_seconds=source_run.timeout_seconds)
+        retry_run_id = str(uuid4())
+        source_input_payload = self._materialize_stored_payload(source_run.input_payload)
+        stored_input_payload = self._prepare_stored_payload(
+            source_input_payload,
+            run_id=retry_run_id,
+            label="run.input_payload",
+        )
+        run = self._repository.create_run(
+            workflow,
+            plan,
+            stored_input_payload,
+            run_id=retry_run_id,
+            environment=source_run.environment,
+            trigger_node_ids=source_run.trigger_node_ids,
+            retry_of_run_id=source_run.id,
+            resume_from_step_index=resume_from_step_index,
+            timeout_seconds=source_run.timeout_seconds,
+        )
         self._emit_event(run_id=run.id, workflow=workflow, event_type="run.queued", message="Retry workflow run queued.", payload={"retry_of_run_id": source_run.id, "resume_from_step_index": resume_from_step_index})
         self._append_audit_log("run.retried", workflow_id=run.workflow_id, workflow_version=run.workflow_version, run_id=run.id, payload={"retry_of_run_id": source_run.id, "resume_from_step_index": resume_from_step_index})
         return run
@@ -943,6 +989,7 @@ class WorkflowService:
             time.sleep(1.0)
 
     def _execute_workflow_run(self, run: WorkflowRun, worker_id: str) -> None:
+        run_input_payload = self._materialize_stored_payload(run.input_payload)
         workflow = self._require_workflow(run.workflow_id, run.workflow_version)
         environment = self._repository.get_environment(run.environment) if run.environment else None
         plan = self._validator.create_execution_plan(workflow)
@@ -957,14 +1004,14 @@ class WorkflowService:
             indegree[edge.target] += 1
 
         if run.execution_state:
-            state = run.execution_state
+            state = self._materialize_stored_payload(run.execution_state)
             queue = deque(state.get("queue", []))
             enqueued = set(state.get("enqueued", []))
             executed = set(state.get("executed", []))
             join_tokens = {key: int(value) for key, value in state.get("join_tokens", {}).items()}
             step_results = self._step_results_from_run(run)
             attempts = {key: int(value) for key, value in state.get("attempts", {}).items()}
-            context = state.get("context") or self._runtime.create_context(workflow, run.input_payload, environment)
+            context = state.get("context") or self._runtime.create_context(workflow, run_input_payload, environment)
         else:
             queue = deque()
             enqueued: set[str] = set()
@@ -972,7 +1019,7 @@ class WorkflowService:
             join_tokens: dict[str, int] = {}
             step_results: list[dict[str, Any]] = []
             attempts: dict[str, int] = {}
-            context = self._runtime.create_context(workflow, run.input_payload, environment)
+            context = self._runtime.create_context(workflow, run_input_payload, environment)
             if run.retry_of_run_id and run.resume_from_step_index:
                 source_run = self._repository.get_run(run.retry_of_run_id)
                 if source_run is None:
@@ -983,13 +1030,22 @@ class WorkflowService:
                         break
                     if source_step.output_payload is None:
                         continue
+                    source_output_payload = self._materialize_stored_payload(source_step.output_payload)
                     node = node_map.get(source_step.node_id)
                     if node is None:
                         continue
-                    self._runtime.update_context(context, node, source_step.output_payload)
-                    self._repository.mark_step_copied(run.id, source_step.index, source_step.output_payload)
+                    self._runtime.update_context(context, node, source_output_payload)
+                    self._repository.mark_step_copied(
+                        run.id,
+                        source_step.index,
+                        self._prepare_stored_payload(
+                            source_output_payload,
+                            run_id=run.id,
+                            label=f"steps.{source_step.index}.output_payload",
+                        ),
+                    )
                     executed.add(source_step.node_id)
-                    step_results.append({"step_index": source_step.index, "node_id": source_step.node_id, "output": source_step.output_payload, "copied": True})
+                    step_results.append({"step_index": source_step.index, "node_id": source_step.node_id, "output": source_output_payload, "copied": True})
                 restart_step = next((step for step in plan.steps if step.index == run.resume_from_step_index), None)
                 if restart_step is not None:
                     queue.append(restart_step.node_id)
@@ -1089,7 +1145,12 @@ class WorkflowService:
                     attempts[node_id] = 0
 
                 self._runtime.update_context(context, node, output_payload)
-                self._repository.mark_step_succeeded(run.id, step.index, output_payload)
+                stored_output_payload = self._prepare_stored_payload(
+                    output_payload,
+                    run_id=run.id,
+                    label=f"steps.{step.index}.output_payload",
+                )
+                self._repository.mark_step_succeeded(run.id, step.index, stored_output_payload)
                 executed.add(node_id)
                 step_results.append({"step_index": step.index, "node_id": step.node_id, "output": output_payload})
                 self._emit_event(run_id=run.id, workflow=workflow, event_type="step.succeeded", message=f"Step {step.index} succeeded.", provider_key=provider_key, step_index=step.index, payload={"node_id": step.node_id, "output": output_payload})
@@ -1113,7 +1174,12 @@ class WorkflowService:
 
             self._mark_remaining_steps(run.id, WorkflowRunStepStatus.skipped, "Step was not activated by the selected execution path.")
             result_payload = {"steps": step_results, "last_output": context["last"]}
-            self._repository.mark_run_succeeded(run.id, result_payload)
+            stored_result_payload = self._prepare_stored_payload(
+                result_payload,
+                run_id=run.id,
+                label="run.result_payload",
+            )
+            self._repository.mark_run_succeeded(run.id, stored_result_payload)
             self._emit_event(run_id=run.id, workflow=workflow, event_type="run.succeeded", message="Workflow run succeeded.", payload=result_payload)
         except Exception as error:
             error_message = str(error)
@@ -1132,7 +1198,11 @@ class WorkflowService:
                             node_id=failed_step.node_id,
                             environment=run.environment,
                             error_message=error_message,
-                            payload={"input_payload": run.input_payload},
+                            payload=self._prepare_stored_payload(
+                                {"input_payload": run_input_payload},
+                                run_id=run.id,
+                                label="dead_letter.payload",
+                            ),
                             created_at=datetime.now(UTC),
                         )
                     )
@@ -1178,17 +1248,22 @@ class WorkflowService:
         return "continue"
 
     def _save_execution_state(self, run_id: str, queue: deque[str], enqueued: set[str], executed: set[str], join_tokens: dict[str, int], step_results: list[dict[str, Any]], context: dict[str, Any], attempts: dict[str, int]) -> None:
+        execution_state = {
+            "queue": list(queue),
+            "enqueued": sorted(enqueued),
+            "executed": sorted(executed),
+            "join_tokens": join_tokens,
+            "step_result_count": len(step_results),
+            "context": context,
+            "attempts": attempts,
+        }
         self._repository.update_run_execution_state(
             run_id,
-            {
-                "queue": list(queue),
-                "enqueued": sorted(enqueued),
-                "executed": sorted(executed),
-                "join_tokens": join_tokens,
-                "step_result_count": len(step_results),
-                "context": context,
-                "attempts": attempts,
-            },
+            self._prepare_stored_payload(
+                execution_state,
+                run_id=run_id,
+                label="run.execution_state",
+            ),
         )
 
     def _step_results_from_run(self, run: WorkflowRun) -> list[dict[str, Any]]:
@@ -1201,11 +1276,12 @@ class WorkflowService:
                 WorkflowRunStepStatus.copied,
             }:
                 continue
+            output_payload = self._materialize_stored_payload(step.output_payload)
             results.append(
                 {
                     "step_index": step.index,
                     "node_id": step.node_id,
-                    "output": step.output_payload,
+                    "output": output_payload,
                     "copied": step.status == WorkflowRunStepStatus.copied,
                 }
             )
@@ -1405,6 +1481,49 @@ class WorkflowService:
             )
         return checks
 
+    def _prepare_stored_payload(self, payload: Any, *, run_id: str, label: str) -> Any:
+        if self._stored_payload_limit_bytes <= 0:
+            return payload
+        if self._payload_size_bytes(payload) <= self._stored_payload_limit_bytes:
+            return payload
+        if isinstance(payload, dict) and payload.get(ARTIFACT_REFERENCE_KEY) is True:
+            return payload
+        if isinstance(payload, dict):
+            prepared = {
+                key: self._prepare_stored_payload(
+                    value,
+                    run_id=run_id,
+                    label=f"{label}.{key}",
+                )
+                for key, value in payload.items()
+            }
+            if self._payload_size_bytes(prepared) <= self._stored_payload_limit_bytes:
+                return prepared
+        elif isinstance(payload, list):
+            prepared = [
+                self._prepare_stored_payload(
+                    value,
+                    run_id=run_id,
+                    label=f"{label}.{index}",
+                )
+                for index, value in enumerate(payload)
+            ]
+            if self._payload_size_bytes(prepared) <= self._stored_payload_limit_bytes:
+                return prepared
+        return self._artifact_store.write_json(run_id=run_id, label=label, value=payload)
+
+    def _materialize_stored_payload(self, payload: Any) -> Any:
+        if isinstance(payload, dict):
+            if payload.get(ARTIFACT_REFERENCE_KEY) is True:
+                return self._artifact_store.read_json(payload)
+            return {key: self._materialize_stored_payload(value) for key, value in payload.items()}
+        if isinstance(payload, list):
+            return [self._materialize_stored_payload(value) for value in payload]
+        return payload
+
+    def _payload_size_bytes(self, payload: Any) -> int:
+        return len(json.dumps(payload, sort_keys=True, default=str).encode("utf-8"))
+
     def _redact_payload(self, payload: Any) -> Any:
         sensitive_keys = {
             "api_key",
@@ -1457,6 +1576,7 @@ class WorkflowService:
         )
 
     def _emit_event(self, *, run_id: str, workflow: WorkflowDefinition, event_type: str, message: str, level: RunEventLevel = RunEventLevel.info, provider_key: str | None = None, step_index: int | None = None, payload: dict[str, Any] | None = None) -> None:
+        redacted_payload = self._redact_payload(payload or {})
         event = WorkflowRunEvent(
             run_id=run_id,
             workflow_id=workflow.id,
@@ -1467,6 +1587,10 @@ class WorkflowService:
             timestamp=datetime.now(UTC),
             provider_key=provider_key,
             step_index=step_index,
-            payload=self._redact_payload(payload or {}),
+            payload=self._prepare_stored_payload(
+                redacted_payload,
+                run_id=run_id,
+                label=f"events.{event_type}.payload",
+            ),
         )
         self._provider_registry.emit(event)

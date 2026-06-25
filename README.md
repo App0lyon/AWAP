@@ -251,6 +251,8 @@ In this mode:
 - the queue interface is explicit, so a managed queue adapter can replace the local SQLite lease-table adapter
 - the API process defaults to `AWAP_WORKER_COUNT=0`; run workers separately with `uv run awap-worker`
 
+Production mode is still an MVP-oriented deployment model. It uses Postgres-compatible persistence and separate worker processes, but AWAP does not ship a managed queue adapter yet. Runs are still claimed through the SQL lease-table queue adapter until a Redis, cloud queue, or Postgres `SKIP LOCKED` adapter is added.
+
 Example production process split:
 
 ```bash
@@ -301,6 +303,24 @@ Optional pool settings:
 export AWAP_DATABASE_POOL_SIZE=10
 export AWAP_DATABASE_MAX_OVERFLOW=20
 ```
+
+### Payload Storage
+
+AWAP avoids storing oversized workflow payloads directly in run records, step records, execution state, and run-event payloads. Values larger than the configured cap are written as JSON artifacts and replaced with artifact references in the database.
+
+By default:
+
+- `AWAP_MAX_STORED_PAYLOAD_BYTES=32768`
+- `AWAP_ARTIFACT_DIR=/tmp/awap-artifacts`
+
+Override them with:
+
+```bash
+export AWAP_MAX_STORED_PAYLOAD_BYTES=65536
+export AWAP_ARTIFACT_DIR=/var/lib/awap/artifacts
+```
+
+The default artifact backend is local filesystem storage. Production deployments should mount this path on durable storage or replace the artifact-store implementation with an external object storage backend.
 
 On Linux/macOS:
 
@@ -531,9 +551,10 @@ uv run pytest
 ## Current Limitations
 
 - no workspace or tenant isolation yet
-- no managed external queue adapter yet; local workers use SQLite-backed leases through the queue abstraction
-- no distributed worker deployment package yet
+- no managed external queue adapter yet; API and worker processes currently use SQL-backed run leases through the queue abstraction
+- distributed workers can be started as separate processes, but the current queue adapter is still the MVP SQL lease-table adapter
 - secret management still relies on application-level encrypted payloads, not an external KMS or vault
+- large run payloads are capped and referenced as filesystem artifacts by default, but no S3/GCS/Azure object-store backend is included yet
 - environment policy is enforceable, but policy authoring is still API-first
 - frontend graph editing is form-based rather than drag-and-drop
 - provider connection checks verify configuration but do not perform live vendor health probes by default

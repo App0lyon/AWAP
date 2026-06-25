@@ -125,6 +125,7 @@ class WorkflowRepository(Protocol):
         plan: ExecutionPlan,
         input_payload: dict,
         *,
+        run_id: str | None = None,
         environment: str | None = None,
         trigger_node_ids: list[str] | None = None,
         idempotency_key: str | None = None,
@@ -770,10 +771,10 @@ class SqlAlchemyWorkflowRepository:
             session.commit()
             return self._to_domain(target)
 
-    def create_run(self, workflow: WorkflowDefinition, plan: ExecutionPlan, input_payload: dict, *, environment: str | None = None, trigger_node_ids: list[str] | None = None, idempotency_key: str | None = None, timeout_seconds: int | None = None, retry_of_run_id: str | None = None, resume_from_step_index: int | None = None) -> WorkflowRun:
+    def create_run(self, workflow: WorkflowDefinition, plan: ExecutionPlan, input_payload: dict, *, run_id: str | None = None, environment: str | None = None, trigger_node_ids: list[str] | None = None, idempotency_key: str | None = None, timeout_seconds: int | None = None, retry_of_run_id: str | None = None, resume_from_step_index: int | None = None) -> WorkflowRun:
         with self._session_factory() as session:
             record = WorkflowRunRecord(
-                id=str(uuid4()),
+                id=run_id or str(uuid4()),
                 workflow_id=workflow.id,
                 workflow_version=workflow.version,
                 environment=environment,
